@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.5
+# Version : 0.9.7
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-03-20
+# Date    : 2026-04-07
 #
 # Purpose
 # -------
@@ -13,17 +13,17 @@
 # This iRule does NOT need to be attached to any Virtual Server.
 #
 # All API communication, token lifecycle management, IP score caching, black-
-# and whitelist evaluation, and statistics counter maintenance live here suo
+# and whitelist evaluation, and statistics counter maintenance live here so
 # that the calling iRules stay thin and policy-free.
-#u
+#
 #
 # Description
 # -----------
 # Procs are called from other iRules using the full iRule path syntax:
 #   call /Common/MIDEYE_SHIELD_COMMON::<PROCNAME> <args>
 #
-# The session subtable name is hardcoded as the constant string "MIDEYE_SHIELD"
-# in every proc rather than held in a variable.e
+# The session subtable name is hardcoded as the constant sbetring "MIDEYE_SHIELD"
+# in every proc rather than held in a variable.
 #
 # The token_fetching sentinel uses "table add" (-excl semantics) rather than
 # incr, because it is a binary lock - not a counter. "table add" only writes
@@ -71,8 +71,10 @@
 #       api_client_secret       - OAuth2 client secret for Shield API
 #       api_down_cache_time     - Seconds to cache API-down state, e.g. 60
 #       api_retry_after         - Seconds before retrying API after down, e.g. 30
+#       api_scope               - The scope to send ie api://app-mideye-shield-dev/.default
 #       api_timeout             - Sideband call timeout in ms, e.g. 3000
 #       api_token_safeguard     - Seconds to shave off token lifetime, e.g. 30
+#       api_token_url           - Auth Token URL, e.g. https://shield.example.com/api/token
 #       dns                     - optional: IP or virtual server name to local DNS Server
 #       disabled                - Set to 1 to bypass all checks
 #       dry_run                 - Set to 1 to evaluate but never hard-reject
@@ -267,6 +269,37 @@ proc _GET_EPOCH {} {
 }
 
 # ---------------------------------------------------------------------------
+# proc: _BUILD_HSSR_ARGS
+#
+# Build a base HSSR argument list in the caller's context via upvar.
+# If the named variable already exists it is appended to, not cleared.
+# Adds -method, -uri, -timeout, -virt and optionally -ns (when the dns
+# setting is non-empty).
+#
+# Arguments:
+#   var_name  - Name of the list variable in the caller's scope
+#   method    - HTTP method (GET or POST)
+#   uri       - Full URL including path and query string
+# ---------------------------------------------------------------------------
+proc _BUILD_HSSR_ARGS { var_name method uri } {
+    upvar 1 $var_name ARGS
+
+    set TIMEOUT [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_timeout"]
+    set HELPER  [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "hssr-helper-vs"]
+    set DNS     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dns"]
+
+    lappend ARGS \
+        -method  $method \
+        -uri     $uri \
+        -timeout $TIMEOUT \
+        -virt    $HELPER
+
+    if { $DNS ne "" } {
+        lappend ARGS -ns $DNS
+    }
+}
+
+# ---------------------------------------------------------------------------
 # proc: _MARK_API_DOWN
 #
 # Record that the API is currently unreachable and set the cache TTL based
@@ -306,17 +339,17 @@ proc _IS_API_DOWN {} {
 # Returns empty string on failure.
 # ---------------------------------------------------------------------------
 proc _GET_VALID_TOKEN {} {
-    set DNS           [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dns"]
     set SAFEGUARD     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_token_safeguard"]
     set TIMEOUT       [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_timeout"]
-    set BASE_URL      [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
+    set TOKEN_URL     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_token_url"]
     set CLIENT_ID     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_client_id"]
     set CLIENT_SECRET [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_client_secret"]
+    set SCOPE         [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_scope"]
     set POLL_INTERVAL [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_poll_interval"]
-    set HELPER        [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "hssr-helper-vs"]
     set NOW           [call /Common/MIDEYE_SHIELD_COMMON::_GET_EPOCH]
 
-    set TOKEN_PATH    /token
+call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL "token"
+call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_exp"
 
     # Return cached token if it still has enough lifetime remaining.
     set CACHED_TOKEN [call /Common/MIDEYE_SHIELD_COMMON::_TBL_GET "token"]
@@ -324,7 +357,7 @@ proc _GET_VALID_TOKEN {} {
 
     if { $CACHED_TOKEN != "" && $TOKEN_EXP != "" } {
         if { ($TOKEN_EXP - $SAFEGUARD) > $NOW } {
-call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: Returning cahced token -> '$CACHED_TOKEN'"
+call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: Returning cached token -> '$CACHED_TOKEN'"
             return $CACHED_TOKEN
         }
     }
@@ -363,31 +396,21 @@ call UTIL::LOG_DEBUG "== TIMEOUT WAITING"
     }
 
     # We own the lock (LOCK_RESULT was 1). Perform the token fetch.
-    set BODY "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}"
+    set BODY "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&scope=${SCOPE}"
 
-    # Build the arguments
-    set ARGS [list \
-            -method  "POST" \
-            -uri     "${BASE_URL}${TOKEN_PATH}" \
-            -body    $BODY \
-            -type    "application/x-www-form-urlencoded" \
-            -timeout $TIMEOUT \
-            -virt    $HELPER \
-            -rbody   RESP_BODY \
-        ]
+    # Build the HSSR argument list with common options and optional DNS.
+    call /Common/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${TOKEN_URL}"
 
-    if {$DNS != ""} {
-        lappend ARGS -ns $DNS
-    }
+    lappend ARGS \
+        -body   $BODY \
+        -type   "application/x-www-form-urlencoded" \
+        -rbody  RESP_BODY
 
     # Perform the sideband token request via HSSR.
     # http_req returns the HTTP status code directly.
     # The response body is received into RESP_BODY via -rbody.
     if { [catch {
-#call /Common/UTIL::LOG_DEBUG "/Common/HSSR::http_req -method  \"POST\" -uri \"${BASE_URL}${TOKEN_PATH}\" -body \"REDACTED\" -type \"application/x-www-form-urlencoded\" -timeout $TIMEOUT -virt $HELPER -rbody RESP_BODY"
-
         set STATUS [call /Common/HSSR::http_req $ARGS]
-
     } ERR] } {
         call /Common/UTIL::LOG_WARNING "Unable to get valid token -> '$ERR'"
 
@@ -406,6 +429,8 @@ call UTIL::LOG_DEBUG "== TIMEOUT WAITING"
         return ""
     }
 
+call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: RESPONSE_BODY: -->$RESP_BODY<--"
+
     # Extract the access_token value from the JSON response body.
     # The pattern matches: "access_token" : "< captured value >"
     if { ![regexp {"access_token"\s*:\s*"([^"]+)"} $RESP_BODY -> NEW_TOKEN] } {    #" <-- syntax highlighting WO
@@ -415,19 +440,27 @@ call UTIL::LOG_DEBUG "== TIMEOUT WAITING"
         return ""
     }
 
+call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: NEW_TOKEN: '$NEW_TOKEN'" true
+
     # Parse the exp claim from the token so we honour the server-issued lifetime.
     set EXP [call /Common/MIDEYE_SHIELD_COMMON::_PARSE_JWT_EXP $NEW_TOKEN]
+
+call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: EXP: '$EXP'"
 
     if { $EXP == 0 } {
         # Could not parse exp - fall back to a conservative 5-minute cache.
         set EXP [expr { [call /Common/MIDEYE_SHIELD_COMMON::_GET_EPOCH] + 300 }]
     }
 
+call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: EXP: '$EXP'"
+
     # Cache the token and its expiry using the remaining token lifetime as TTL.
     set TTL [expr { $EXP - [call /Common/MIDEYE_SHIELD_COMMON::_GET_EPOCH] }]
 
-    call /Common/MIDEYE_SHIELD_COMMON::_TBL_SET "token"     $NEW_TOKEN $TTL indefinite
-    call /Common/MIDEYE_SHIELD_COMMON::_TBL_SET "token_exp" $EXP       $TTL indefinite
+call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: TTL: '$TTL'"
+
+    call /Common/MIDEYE_SHIELD_COMMON::_TBL_SET "token"     $NEW_TOKEN $TTL $TTL
+    call /Common/MIDEYE_SHIELD_COMMON::_TBL_SET "token_exp" $EXP       $TTL $TTL
 
     # Release the lock so a future expiry triggers a fresh fetch.
     call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_fetching"
@@ -454,7 +487,6 @@ call UTIL::LOG_DEBUG "== TIMEOUT WAITING"
 #   -3     - pending queue for this IP is full (deny_pending_max)
 # ---------------------------------------------------------------------------
 proc _FETCH_IP_SCORE { client_ip cache_time } {
-    set DNS           [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dns"]
     set SAFE_IP       [call /Common/MIDEYE_SHIELD_COMMON::_SANITIZE_IP_KEY $client_ip]
     set SCORE_KEY     "score_${SAFE_IP}"
     set PEND_KEY      "pending_${SAFE_IP}"
@@ -462,9 +494,10 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
     set PENDING_MAX   [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_max"]
     set POLL_INTERVAL [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_poll_interval"]
     set BASE_URL      [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
-    set HELPER        [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "hssr-helper-vs"]
 
-    set SCORE_PATH    /score
+    set SCORE_PATH    /ips
+
+#    table set -subtable "MIDEYE_SHIELD" $PEND_KEY 0
 
     # Atomically increment the pending counter for this IP.
     # The first caller gets 1 and is elected as the API caller.
@@ -493,18 +526,20 @@ call UTIL::LOG_DEBUG "=== _FETCH_IP_SCORE: PEND_VAL: $PEND_VAL"
             return -2
         }
 
+        # Build the HSSR argument list with common options and optional DNS.
+        call /Common/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "GET" "${BASE_URL}${SCORE_PATH}/${client_ip}"
+        lappend ARGS \
+            -debug  1 \
+            -headers [list "Authorization" "Bearer ${TOKEN}"] \
+            -rbody   RESP_BODY
+
+call /Common/UTIL::LOG_DEBUG "==== _FETCH_IP_SCORE: ARGS: $ARGS"
+
         # Perform the sideband score request via HSSR.
         # http_req returns the HTTP status code directly.
         # The response body is received into RESP_BODY via -rbody.
         if { [catch {
-            set STATUS [call /Common/HSSR::http_req \
-                -method  "GET" \
-                -uri     "${BASE_URL}${SCORE_PATH}?ip=${client_ip}" \
-                -headers [list "Authorization" "Bearer ${TOKEN}"] \
-                -timeout $TIMEOUT \
-                -virt    $HELPER \
-                -rbody   RESP_BODY \
-            ]
+            set STATUS [call /Common/HSSR::http_req $ARGS]
         } ERR] } {
             call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
@@ -597,7 +632,6 @@ proc _VALIDATE { client_ip cache_time } {
 
     # Read control flags and thresholds once to stay consistent for this call.
     set DISABLED            [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "disabled"]
-    set DNS                 [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dns"]
     set DRY_RUN             [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dry_run"]
     set HARD_DENY_THRESHOLD [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "score_hard_deny"]
     set WARN_THRESHOLD      [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "score_warn"]
@@ -659,7 +693,7 @@ proc _VALIDATE { client_ip cache_time } {
             call /Common/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blocked"
 
             if { $DRY_RUN eq "1" } {
-                call /Common/UTIL::LOG_WARNING "DRY RUN - Would have denied IP due to too many pending conenctions from '$client_ip'"
+                call /Common/UTIL::LOG_WARNING "DRY RUN - Would have denied IP due to too many pending connections from '$client_ip'"
                 return 1
             }
 
@@ -757,23 +791,20 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
     }
 
     set BASE_URL    [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
-    set DNS         [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dns"]
-    set TIMEOUT     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_timeout"]
-    set HELPER      [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "hssr-helper-vs"]
     set REPORT_PATH /report
 
     set BODY "{\"ip\":\"${client_ip}\",\"auth_result\":\"${auth_result}\"}"
 
+    # Build the HSSR argument list with common options and optional DNS.
+    call /Common/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
+    lappend ARGS \
+        -headers [list "Authorization" "Bearer ${TOKEN}"] \
+        -body    $BODY \
+        -type    "application/json"
+
     # Fire and forget - catch but discard any error.
     catch {
-        call /Common/HSSR::http_req \
-            -method  "POST" \
-            -uri     "${BASE_URL}${REPORT_PATH}" \
-            -headers [list "Authorization" "Bearer ${TOKEN}"] \
-            -body    $BODY \
-            -type    "application/json" \
-            -timeout $TIMEOUT \
-            -virt    $HELPER \
+        call /Common/HSSR::http_req $ARGS
     }
 }
 
