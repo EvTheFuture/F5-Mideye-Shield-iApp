@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.7
+# Version : 0.9.8
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-04-07
+# Date    : 2026-04-15
 #
 # Purpose
 # -------
@@ -22,7 +22,7 @@
 # Procs are called from other iRules using the full iRule path syntax:
 #   call /Common/MIDEYE_SHIELD_COMMON::<PROCNAME> <args>
 #
-# The session subtable name is hardcoded as the constant sbetring "MIDEYE_SHIELD"
+# The session subtable name is hardcoded as the constant string "MIDEYE_SHIELD"
 # in every proc rather than held in a variable.
 #
 # The token_fetching sentinel uses "table add" (-excl semantics) rather than
@@ -348,9 +348,6 @@ proc _GET_VALID_TOKEN {} {
     set POLL_INTERVAL [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_poll_interval"]
     set NOW           [call /Common/MIDEYE_SHIELD_COMMON::_GET_EPOCH]
 
-call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL "token"
-call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_exp"
-
     # Return cached token if it still has enough lifetime remaining.
     set CACHED_TOKEN [call /Common/MIDEYE_SHIELD_COMMON::_TBL_GET "token"]
     set TOKEN_EXP    [call /Common/MIDEYE_SHIELD_COMMON::_TBL_GET "token_exp"]
@@ -471,8 +468,12 @@ call UTIL::LOG_DEBUG "== _GET_VALID_TOKEN: TTL: '$TTL'"
 # ---------------------------------------------------------------------------
 # proc: _FETCH_IP_SCORE
 #
-# Call the Shield API to get a score for the given IP address.
+# Call the Shield API to get a risk score for the given IP address.
 # Manages the pending-connections counter and the score sentinel (-1).
+#
+# The API returns a JSON object with a nested riskScore structure:
+#   {"ipAddress":"x.x.x.x","riskScore":{"overall":N,"severity":N,"velocity":N}}
+# The "overall" field is used as the score for allow/deny decisions.
 #
 # The cache_time argument controls how long the resolved score is cached.
 # Callers pass different values depending on context (connection vs login).
@@ -496,8 +497,6 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
     set BASE_URL      [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
 
     set SCORE_PATH    /ips
-
-#    table set -subtable "MIDEYE_SHIELD" $PEND_KEY 0
 
     # Atomically increment the pending counter for this IP.
     # The first caller gets 1 and is elected as the API caller.
@@ -558,16 +557,21 @@ call /Common/UTIL::LOG_DEBUG "==== _FETCH_IP_SCORE: ARGS: $ARGS"
             return -2
         }
 
-        # Parse the score integer from the JSON response body.
-        # Pattern matches: "score" : <digits>
-        if { ![regexp {"score"\s*:\s*(\d+)} $RESP_BODY -> SCORE] } {
+call /Common/UTIL::LOG_DEBUG "==== _FETCH_IP_SCORE: RESP_BODY: $RESP_BODY"
+
+        # Parse the overall risk score from the JSON response body.
+        # The API returns: {"ipAddress":"...","riskScore":{"overall":N,...}}
+        # Pattern matches: "overall" : <digits> inside the riskScore object.
+        if { ![regexp {"overall"\s*:\s*(\d+)} $RESP_BODY -> SCORE] } {
             call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /Common/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             call /Common/MIDEYE_SHIELD_COMMON::_MARK_API_DOWN
 
-            call /Common/UTIL::LOG_WARNING "WARNING: Unable to fetch IP Score from API Response -> '{$RESP_BODY}'"
+            call /Common/UTIL::LOG_WARNING "WARNING: Unable to parse riskScore.overall from API Response -> '{$RESP_BODY}'"
             return -2
         }
+
+call /Common/UTIL::LOG_DEBUG "==== _FETCH_IP_SCORE: SCORE: $SCORE"
 
         # Write the resolved score to cache and release the pending key.
         # Use the cache_time supplied by the caller (connection vs login TTL).
@@ -731,6 +735,7 @@ proc _VALIDATE { client_ip cache_time } {
     }
 
     call /Common/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_score"
+    call /Common/UTIL::LOG_DEBUG "===== INSIDE _VALIDATE main exit (ALLOWED)"
     return 1
 }
 
@@ -783,28 +788,71 @@ proc VALIDATE_LOGIN { client_ip } {
 # This is fire-and-forget - errors are logged but never propagated.
 # ---------------------------------------------------------------------------
 proc REPORT_AUTH_RESULT { client_ip auth_result } {
-    set TOKEN [call /Common/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
-
-    if { $TOKEN eq "" } {
-        log local0.warning "REPORT_AUTH_RESULT - No valid API token, skipping report for '$client_ip'"
-        return
-    }
-
-    set BASE_URL    [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
-    set REPORT_PATH /report
-
-    set BODY "{\"ip\":\"${client_ip}\",\"auth_result\":\"${auth_result}\"}"
-
-    # Build the HSSR argument list with common options and optional DNS.
-    call /Common/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
-    lappend ARGS \
-        -headers [list "Authorization" "Bearer ${TOKEN}"] \
-        -body    $BODY \
-        -type    "application/json"
-
-    # Fire and forget - catch but discard any error.
     catch {
-        call /Common/HSSR::http_req $ARGS
+        set status ""
+
+        set TOKEN [call /Common/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
+
+        if {$TOKEN == ""} {
+            log local0.warning "REPORT_AUTH_RESULT - No valid API token, skipping report for '$client_ip'"
+            return
+        }
+
+        set BASE_URL    [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
+        set REPORT_PATH /ips/events
+
+        set reason  [string tolower [ACCESS::session data get session.custom.shield.reason]]
+        set method  [string tolower [ACCESS::session data get session.custom.shield.method]]
+        set user    [ACCESS::session data get session.logon.last.username]
+
+        if {$method == ""} {
+            set method "unknown"
+        }
+
+        if {$reason == "success" || $auth_result == "allow"} {
+            set outcome "success"
+        } else {
+            set outcome $reason
+        }
+
+        binary scan [sha512 "TODO REPLACE-ME-WITH_CONFIG_VARIABLE-$user"] H* hashed_user
+
+        set BODY    "{"
+        append BODY "\"events\": \["
+        append BODY "{"
+        append BODY "\"ipAddress\":\"${client_ip}\""
+        append BODY ",\"observedAt\": \"[clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]\""
+        append BODY ",\"authentication\": {"
+        append BODY "\"outcome\": \"$outcome\""
+        append BODY ",\"usernameHash\": \"$hashed_user\""
+
+        if {$outcome == "success"} {
+            append BODY ",\"method\": \"$method\""
+        }
+
+        append BODY "}"
+        append BODY "}"
+        append BODY "\]"
+        append BODY "}"
+
+        call /Common/UTIL::LOG_DEBUG "=== Sending body ->$BODY<-"
+        # Build the HSSR argument list with common options and optional DNS.
+        call /Common/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
+        lappend ARGS \
+            -headers [list "Authorization" "Bearer ${TOKEN}"] \
+            -body    $BODY \
+            -type    "application/json"
+
+        # Fire and forget - catch but discard any error.
+        catch {
+            set status [call /Common/HSSR::http_req $ARGS]
+        }
+    } err
+
+    if {$err != "" && $err != 0} {
+        log local0.warning "Something went wrong when sending result to SHIELD: '$err'"
+    } else {
+        call /Common/UTIL::LOG_DEBUG "== STATUS CODE from /ips/events: '$status'"
     }
 }
 

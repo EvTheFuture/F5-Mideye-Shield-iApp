@@ -57,20 +57,21 @@
 
 when ACCESS_POLICY_AGENT_EVENT {
     # Only act on the validate_ip event triggered from the access profile.
-    if { [ACCESS::policy event name] eq "validate_ip" } {
-        if { [call /Common/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]] } {
-            ACCESS::session data set "session.custom.shield.allow" 1
-        } else {
-            ACCESS::session data set "session.custom.shield.allow" 0
-        }
+    if {[string toupper [ACCESS::policy agent_id]] == "MIDEYE_SHIELD-VALIDATE_IP"} {
+        set allow [call /Common/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]]
+        ACCESS::session data set session.custom.shield.allow $allow
+
+        call /Common/UTIL::LOG_DEBUG "Allow status set to '$allow'"
     }
 }
 
 when ACCESS_POLICY_COMPLETED {
     # Report the final authentication outcome back to the Shield API.
     # Map the APM policy result to "allow" or "deny" for the Shield API.
-    if { [ACCESS::session data get "session.user.sessionid"] ne "" } {
-        if { [ACCESS::policy result] eq "allow" } {
+    if {[ACCESS::session data get "session.user.sessionid"] != ""} {
+        set reason [string tolower [ACCESS::session data get session.custom.shield.reason]]
+
+        if {[ACCESS::policy result] == "allow" || $reason == "success"} {
             call /Common/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "allow"
         } else {
             call /Common/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "deny"
