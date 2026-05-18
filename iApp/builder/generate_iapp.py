@@ -190,6 +190,7 @@ def collect_setting_names(settings):
                 "required": field.get("required", False),
                 "display": field.get("display", "medium"),
                 "default": field.get("default", ""),
+                "choices": field.get("choices", []),
             }
 
             result.append(entry)
@@ -242,8 +243,15 @@ def cross_check(statics, setting_entries, strict):
 
 
 def build_presentation(setting_entries, settings):
-    # Build the TCL DSL block that goes inside presentation { ... }.
-    # Format follows the example tmpl supplied with this project.
+    # Build the APL block that goes inside presentation { ... }.
+    # Supported element types:
+    #   string  -> "string field [required] display "<size>" default "<value>""
+    #   choice  -> "choice field [required] display "<size>" default "<value>" {
+    #                   "<label1>" => "<value1>",
+    #                   "<label2>" => "<value2>"
+    #               }"
+    # Reference for the choice syntax:
+    #   https://clouddocs.f5.com/api/iapps/choice.html
     lines = []
 
     # Group entries back into sections in the original order
@@ -264,22 +272,91 @@ def build_presentation(setting_entries, settings):
         lines.append(f"section {sid} {{")
 
         for entry in section_map[sid]:
-            parts = ["    ", entry["type"], " ", entry["field_id"]]
+            etype = entry["type"]
 
-            if entry["required"]:
-                parts.append(" required")
-
-            parts.append(f' display "{entry["display"]}"')
-
-            # Escape any double quote in the default value
-            default_escaped = entry["default"].replace('"', '\\"')
-            parts.append(f' default "{default_escaped}"')
-
-            lines.append("".join(parts))
+            if etype == "choice":
+                lines.extend(_render_choice(entry))
+            elif etype == "string":
+                lines.append(_render_string(entry))
+            else:
+                sys.stderr.write(
+                    f"WARNING: Unknown type '{etype}' for setting "
+                    f"'{entry['name']}', falling back to 'string'.\n"
+                )
+                lines.append(_render_string(entry))
 
         lines.append("}")
 
     return "\n".join(lines)
+
+
+def _render_string(entry):
+    # Render a single "string" APL element as one line.
+    parts = ["    string ", entry["field_id"]]
+
+    if entry["required"]:
+        parts.append(" required")
+
+    parts.append(f' display "{entry["display"]}"')
+
+    # Escape any double quote in the default value
+    default_escaped = entry["default"].replace('"', '\\"')
+    parts.append(f' default "{default_escaped}"')
+
+    return "".join(parts)
+
+
+def _render_choice(entry):
+    # Render a "choice" APL element. Spans multiple lines for readability.
+    # The default value (right-hand side) must reference one of the choice
+    # values, not a label.
+    choices = entry["choices"]
+
+    # Sanity check: a choice must have at least one entry
+    if not choices:
+        sys.stderr.write(
+            f"WARNING: Setting '{entry['name']}' has type 'choice' but no "
+            f"'choices' array. The iApp will render an empty dropdown.\n"
+        )
+
+    # Sanity check: the default must match a value in the choices list
+    default = entry["default"]
+    choice_values = {c["value"] for c in choices}
+
+    if default and default not in choice_values:
+        sys.stderr.write(
+            f"WARNING: Setting '{entry['name']}' has default '{default}' "
+            f"which is not present in its choices. The iApp will fall back "
+            f"to the first choice as default.\n"
+        )
+
+    # Build the header line: "choice <field> [required] display "<size>" default "<value>" {"
+    header_parts = ["    choice ", entry["field_id"]]
+
+    if entry["required"]:
+        header_parts.append(" required")
+
+    header_parts.append(f' display "{entry["display"]}"')
+
+    if default:
+        default_escaped = default.replace('"', '\\"')
+        header_parts.append(f' default "{default_escaped}"')
+
+    header_parts.append(" {")
+    lines = ["".join(header_parts)]
+
+    # Emit each choice as: "        "<label>" => "<value>","
+    # The final entry has no trailing comma.
+    for i, choice in enumerate(choices):
+        label = choice["label"].replace('"', '\\"')
+        value = choice["value"].replace('"', '\\"')
+        suffix = "," if i < len(choices) - 1 else ""
+
+        lines.append(f'        "{label}" => "{value}"{suffix}')
+
+    lines.append("    }")
+
+    return lines
 
 
 def build_text_block(setting_entries, settings):
@@ -343,6 +420,46 @@ def build_subst_map_entries(setting_entries):
     return " \\\n    ".join(parts)
 
 
+def count_unescaped_quotes(text):
+    # Count unescaped " characters. A backslash escapes the next character.
+    # This mirrors how tmsh's outer parser tracks string state inside
+    # braced blocks like implementation { ... } and the value of any field
+    # held in a TCL braced string.
+    count = 0
+    i = 0
+
+    while i < len(text):
+        ch = text[i]
+
+        if ch == "\\" and i + 1 < len(text):
+            # Skip the escaped character entirely
+            i += 2
+            continue
+
+        if ch == '"':
+            count += 1
+
+        i += 1
+
+    return count
+
+
+def find_odd_quote_lines(text):
+    # Return a list of (line_number, count, line_content) for lines whose
+    # unescaped " count is odd. tmsh's quote tracking does NOT reset at
+    # newlines, but if every line has an even count, cumulative parity is
+    # preserved and tmsh stays in the right state.
+    bad = []
+
+    for i, line in enumerate(text.split("\n"), 1):
+        n = count_unescaped_quotes(line)
+
+        if n % 2 == 1:
+            bad.append((i, n, line))
+
+    return bad
+
+
 def build_irule_bodies(rule_files):
     # For each iRule file, build a "set <varname> { ... }" block where the
     # iRule TCL source is embedded verbatim. Returns the full text block.
@@ -369,6 +486,33 @@ def build_irule_bodies(rule_files):
                 f"The generated iApp will not parse on the BIG-IP.\n"
             )
             sys.exit(3)
+
+        # Sanity check: each line should have an even number of unescaped
+        # double quotes, otherwise tmsh's outer parser loses string-context
+        # tracking when it parses the iApp implementation block. The result
+        # is a cryptic "Missing RCURLY" error at template import time.
+        # Fix offending lines by adding a balancing comment such as
+        #     ;# trailing " to keep quote count even
+        odd_lines = find_odd_quote_lines(body)
+
+        if odd_lines:
+            sys.stderr.write(
+                f"ERROR: {filename} contains line(s) with an odd number of "
+                f"unescaped double quotes. This will break tmsh's parser "
+                f"when the iApp is imported (Missing RCURLY).\n"
+            )
+
+            for line_no, count, line in odd_lines:
+                sys.stderr.write(
+                    f"  Line {line_no} ({count} unescaped quotes): "
+                    f"{line.strip()[:120]}\n"
+                )
+
+            sys.stderr.write(
+                "Add a balancing comment such as ';# \"' at the end of the "
+                "line to bring the quote count to an even number.\n"
+            )
+            sys.exit(4)
 
         # Use {*}... braces. Comments lead with #, which inside a braced
         # string is just text, so no escaping needed.
@@ -430,6 +574,53 @@ def generate(shell, setting_entries, settings, rule_files):
             )
 
         result = result.replace(marker, value)
+
+    # Final safety check on the assembled output. The iRule bodies were
+    # already checked individually, but the shell text itself (or the
+    # injected presentation block) may contain unbalanced quotes that
+    # would trip up tmsh's parser at import time. We check the entire
+    # implementation { ... } block end-to-end.
+    impl_match = re.search(r"implementation\s*\{", result)
+
+    if impl_match is not None:
+        # Extract the implementation block by brace counting.
+        start = impl_match.end()
+        depth = 1
+        pos = start
+
+        while pos < len(result) and depth > 0:
+            if result[pos] == "{":
+                depth += 1
+            elif result[pos] == "}":
+                depth -= 1
+
+            pos += 1
+
+        impl_block = result[start:pos - 1]
+
+        odd_lines = find_odd_quote_lines(impl_block)
+
+        if odd_lines:
+            start_line = result[:start].count("\n") + 1
+
+            sys.stderr.write(
+                "ERROR: The implementation block in the generated tmpl "
+                "contains line(s) with an odd number of unescaped double "
+                "quotes. tmsh will fail with 'Missing RCURLY' at import.\n"
+            )
+
+            for line_offset, count, line in odd_lines:
+                sys.stderr.write(
+                    f"  Generated tmpl line {start_line + line_offset - 1} "
+                    f"({count} unescaped quotes): {line.strip()[:120]}\n"
+                )
+
+            sys.stderr.write(
+                "If the offending line is in the iApp shell template "
+                "(iapp-template.txt), add a balancing comment such as "
+                "';# \"' at the end of the line.\n"
+            )
+            sys.exit(5)
 
     return result
 

@@ -77,7 +77,7 @@ if { $::hash__username_salt eq "" } {
         # so the rule lives in the iApp folder. tmsh::get_config will find
         # it by short name when run inside the iApp implementation context.
         set _existing_rule [tmsh::get_config /ltm rule MIDEYE_SHIELD_COMMON]
-        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt
+        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt    ;# Trailing " to keep an even number of unescaped double quotes on this line, so tmsh's outer parser does not lose track of string state when reading the iApp implementation block.
     }
 
     if { $_existing_salt ne "" } {

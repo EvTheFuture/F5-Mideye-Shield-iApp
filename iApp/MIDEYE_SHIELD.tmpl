@@ -77,7 +77,7 @@ if { $::hash__username_salt eq "" } {
         # so the rule lives in the iApp folder. tmsh::get_config will find
         # it by short name when run inside the iApp implementation context.
         set _existing_rule [tmsh::get_config /ltm rule MIDEYE_SHIELD_COMMON]
-        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt
+        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt    ;# Trailing " to keep an even number of unescaped double quotes on this line, so tmsh's outer parser does not lose track of string state when reading the iApp implementation block.
     }
 
     if { $_existing_salt ne "" } {
@@ -102,7 +102,8 @@ if { $::hash__username_salt eq "" } {
 # must map to the iApp variable $::section__field. The map is built once and
 # applied to all iRule bodies below.
 # ---------------------------------------------------------------------------
-set _SUBST_MAP [list "__api__base_url__" "$::api__base_url" \
+set _SUBST_MAP [list "__log__debug__" "$::log__debug" \
+    "__api__base_url__" "$::api__base_url" \
     "__api__client_id__" "$::api__client_id" \
     "__api__client_secret__" "$::api__client_secret" \
     "__api__scope__" "$::api__scope" \
@@ -245,8 +246,7 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 #
 # Static variables are shared across all iRules on the same TMM, so the values
 # defined here are available to MIDEYE_SHIELD_APM, MIDEYE_SHIELD_CONNECTION,
-# and any future Shield iRule via plain $static::MIDEYE_SHIELD_<key> reads,
-# or by calling the _DG_GET proc which preserves the original lookup API.
+# and any future Shield iRule via plain $static::MIDEYE_SHIELD_<key> reads.
 #
 #
 # Description
@@ -357,8 +357,11 @@ when RULE_INIT {
     #
     # NOTE: The iApp template generator script scans this block to discover
     # which settings exist. Every variable declared here MUST have a matching
-    # entry in the iApp template (variables/labels/presentation) or the
+    # entry in the iApp settings json (variables/labels/presentation) or the
     # generator will emit a warning.
+
+    # API Settings
+    set static::MIDEYE_SHIELD_log_debug              "__log__debug__"
 
     # API Settings
     set static::MIDEYE_SHIELD_api_base_url           "__api__base_url__"
@@ -467,35 +470,6 @@ proc _LOG_COMMON {level msg {noname false}} {
         # Move to the next chunk
         set start $end
     }
-}
-
-# ---------------------------------------------------------------------------
-# proc: _DG_GET
-#
-# Read a single setting by its original Data Group key name.
-#
-# Settings used to live in the MIDEYE_SHIELD_SETTINGS data group but are now
-# stored as TCL static variables in the static:: namespace, populated in
-# RULE_INIT from values injected by the Mideye Shield iApp.
-#
-# This proc is kept as a thin compatibility shim so the original call sites
-# in this iRule remain unchanged. It maps the legacy key (which may contain
-# hyphens, e.g. "hssr-helper-vs") to the equivalent static variable name
-# (hyphens replaced with underscores) and returns its value.
-#
-# Returns empty string if the variable is not defined.
-# ---------------------------------------------------------------------------
-proc _DG_GET { key } {
-    # Map legacy key syntax to a valid TCL variable name suffix.
-    # Only hyphens are problematic; all other characters in the known key
-    # set are already valid (letters, digits, underscore).
-    set varname "static::MIDEYE_SHIELD_[string map {- _} $key]"
-
-    if { ![info exists $varname] } {
-        return ""
-    }
-
-    return [set $varname]
 }
 
 # ---------------------------------------------------------------------------
@@ -630,9 +604,9 @@ proc _GET_EPOCH {} {
 proc _BUILD_HSSR_ARGS { var_name method uri } {
     upvar 1 $var_name ARGS
 
-    set TIMEOUT [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_timeout"]
-    set HELPER  [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "hssr-helper-vs"]
-    set DNS     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dns"]
+    set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
+    set HELPER  $static::MIDEYE_SHIELD_hssr_helper_vs
+    set DNS     $static::MIDEYE_SHIELD_dns
 
     lappend ARGS \
         -method  $method \
@@ -640,7 +614,7 @@ proc _BUILD_HSSR_ARGS { var_name method uri } {
         -timeout $TIMEOUT \
         -virt    $HELPER
 
-    if { $DNS ne "" } {
+    if { $DNS != "" } {
         lappend ARGS -ns $DNS
     }
 }
@@ -652,7 +626,7 @@ proc _BUILD_HSSR_ARGS { var_name method uri } {
 # on the api_down_cache_time setting.
 # ---------------------------------------------------------------------------
 proc _MARK_API_DOWN {} {
-    set DOWN_TIME [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_down_cache_time"]
+    set DOWN_TIME $static::MIDEYE_SHIELD_api_down_cache_time
     call /Common/MIDEYE_SHIELD_COMMON::_TBL_SET "api_down" 1 $DOWN_TIME $DOWN_TIME
 }
 
@@ -685,13 +659,13 @@ proc _IS_API_DOWN {} {
 # Returns empty string on failure.
 # ---------------------------------------------------------------------------
 proc _GET_VALID_TOKEN {} {
-    set SAFEGUARD     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_token_safeguard"]
-    set TIMEOUT       [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_timeout"]
-    set TOKEN_URL     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_token_url"]
-    set CLIENT_ID     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_client_id"]
-    set CLIENT_SECRET [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_client_secret"]
-    set SCOPE         [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_scope"]
-    set POLL_INTERVAL [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_poll_interval"]
+    set SAFEGUARD     $static::MIDEYE_SHIELD_api_token_safeguard
+    set TIMEOUT       $static::MIDEYE_SHIELD_api_timeout
+    set TOKEN_URL     $static::MIDEYE_SHIELD_api_token_url
+    set CLIENT_ID     $static::MIDEYE_SHIELD_api_client_id
+    set CLIENT_SECRET $static::MIDEYE_SHIELD_api_client_secret
+    set SCOPE         $static::MIDEYE_SHIELD_api_scope
+    set POLL_INTERVAL $static::MIDEYE_SHIELD_pending_poll_interval
     set NOW           [call /Common/MIDEYE_SHIELD_COMMON::_GET_EPOCH]
 
     # Return cached token if it still has enough lifetime remaining.
@@ -832,10 +806,10 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
     set SAFE_IP         [call /Common/MIDEYE_SHIELD_COMMON::_SANITIZE_IP_KEY $client_ip]
     set SCORE_KEY       "score_${SAFE_IP}"
     set PEND_KEY        "pending_${SAFE_IP}"
-    set TIMEOUT         [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_timeout"]
-    set PENDING_MAX     [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_max"]
-    set POLL_INTERVAL   [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "pending_poll_interval"]
-    set BASE_URL        [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
+    set TIMEOUT         $static::MIDEYE_SHIELD_api_timeout
+    set PENDING_MAX     $static::MIDEYE_SHIELD_pending_max
+    set POLL_INTERVAL   $static::MIDEYE_SHIELD_pending_poll_interval
+    set BASE_URL        $static::MIDEYE_SHIELD_api_base_url
 
     set SCORE_PATH    /ips
 
@@ -1017,10 +991,10 @@ call /Common/MIDEYE_SHIELD_COMMON::LOG_DEBUG "==== _FETCH_IP_SCORE: SCORE: $SCOR
 # ---------------------------------------------------------------------------
 proc _VALIDATE { client_ip cache_time } {
     # Read control flags and thresholds once to stay consistent for this call.
-    set DISABLED            [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "disabled"]
-    set DRY_RUN             [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "dry_run"]
-    set HARD_DENY_THRESHOLD [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "score_hard_deny"]
-    set WARN_THRESHOLD      [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "score_warn"]
+    set DISABLED            $static::MIDEYE_SHIELD_disabled
+    set DRY_RUN             $static::MIDEYE_SHIELD_dry_run
+    set HARD_DENY_THRESHOLD $static::MIDEYE_SHIELD_score_hard_deny
+    set WARN_THRESHOLD      $static::MIDEYE_SHIELD_score_warn
 
     call /Common/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE $client_ip $cache_time: DISABLED: $DISABLED"
 
@@ -1158,7 +1132,9 @@ proc LOG_INFO {msg {noname false}} {
 # Returns void
 # ---------------------------------------------------------------------------
 proc LOG_DEBUG {msg {noname false}} {
-    call /Common/MIDEYE_SHIELD_COMMON::_LOG_COMMON debug $msg $noname
+    if {$static::MIDEYE_SHIELD_log_debug == 1} {
+        call /Common/MIDEYE_SHIELD_COMMON::_LOG_COMMON debug $msg $noname
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1174,7 +1150,7 @@ proc LOG_DEBUG {msg {noname false}} {
 #   }
 # ---------------------------------------------------------------------------
 proc VALIDATE_CONNECTION { client_ip } {
-    set CACHE_TIME [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "score_cache_time"]
+    set CACHE_TIME $static::MIDEYE_SHIELD_score_cache_time
     return [call /Common/MIDEYE_SHIELD_COMMON::_VALIDATE $client_ip $CACHE_TIME]
 }
 
@@ -1192,7 +1168,7 @@ proc VALIDATE_CONNECTION { client_ip } {
 #   }
 # ---------------------------------------------------------------------------
 proc VALIDATE_LOGIN { client_ip } {
-    set CACHE_TIME [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "login_score_cache_time"]
+    set CACHE_TIME $static::MIDEYE_SHIELD_login_score_cache_time
     return [call /Common/MIDEYE_SHIELD_COMMON::_VALIDATE $client_ip $CACHE_TIME]
 }
 
@@ -1216,9 +1192,9 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
             return
         }
 
-        set SALT        [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "username_salt"]
+        set SALT        $static::MIDEYE_SHIELD_username_salt
 
-        set BASE_URL    [call /Common/MIDEYE_SHIELD_COMMON::_DG_GET "api_base_url"]
+        set BASE_URL    $static::MIDEYE_SHIELD_api_base_url
         set REPORT_PATH /ips/events
 
         set reason  [string tolower [ACCESS::session data get session.custom.shield.reason]]
@@ -1443,23 +1419,35 @@ tmsh::create ltm rule MIDEYE_SHIELD_CONNECTION $_BODY_MIDEYE_SHIELD_CONNECTION
             }
             presentation {
 
+section log {
+    choice debug display "small" default "0" {
+        "Yes" => "1",
+        "No" => "0"
+    }
+}
 section api {
     string base_url required display "xlarge" default "https://shield.prod.mideye.com/api/v2"
     string client_id required display "xlarge" default ""
     string client_secret required display "xlarge" default ""
     string scope required display "xlarge" default "api://app-mideye-shield-prod/.default"
-    string token_url required display "xlarge" default "https://login.mideye.com/oauth2/v2.0/token"
+    string token_url required display "xlarge" default "https://login.prod.mideye.com/oauth2/v2.0/token"
     string timeout required display "medium" default "2500"
     string token_safeguard required display "medium" default "30"
     string down_cache_time required display "medium" default "5"
     string retry_after required display "medium" default "30"
 }
 section behaviour {
-    string disabled required display "small" default "0"
-    string dry_run required display "small" default "1"
+    choice disabled display "small" default "0" {
+        "Yes" => "1",
+        "No" => "0"
+    }
+    choice dry_run display "small" default "1" {
+        "Yes" => "1",
+        "No" => "0"
+    }
 }
 section score {
-    string hard_deny required display "small" default "75"
+    string hard_deny required display "small" default "70"
     string warn required display "small" default "40"
     string cache_time required display "medium" default "300"
     string login_cache_time required display "medium" default "10"
@@ -1477,6 +1465,8 @@ section hash {
 }
 
 text {
+    log                       "Debug"
+    log.debug                 "Enable Debug Logging"
     api                       "API Settings"
     api.base_url              "API Base URL"
     api.client_id             "API Client ID"
@@ -1488,8 +1478,8 @@ text {
     api.down_cache_time       "API Down Cache Time (seconds)"
     api.retry_after           "API Retry After (seconds)"
     behaviour                 "Behaviour"
-    behaviour.disabled        "Disabled (1 = bypass all Shield checks)"
-    behaviour.dry_run         "Dry Run (1 = evaluate but never hard-reject)"
+    behaviour.disabled        "Bypass All Shield Checks"
+    behaviour.dry_run         "Dry Run Mode"
     score                     "Score Thresholds and Caching"
     score.hard_deny           "Hard Deny Threshold (score at or above is denied)"
     score.warn                "Warn Threshold (score at or above logs a warning)"

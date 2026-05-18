@@ -3,6 +3,24 @@
 
     "sections": [
         {
+            "id": "log",
+            "label": "Debug",
+            "fields": [
+                {
+                    "name": "log_debug",
+                    "field": "debug",
+                    "label": "Enable Debug Logging",
+                    "type": "choice",
+                    "display": "small",
+                    "default": "0",
+		    "choices": [
+			{"value": "1", "label": "Yes"},
+			{"value": "0", "label": "No"}
+		    ]
+                }
+            ]
+        },
+        {
             "id": "api",
             "label": "API Settings",
             "fields": [
@@ -89,30 +107,36 @@
                 }
             ]
         },
-        {
-            "id": "behaviour",
-            "label": "Behaviour",
-            "fields": [
-                {
-                    "name": "disabled",
-                    "field": "disabled",
-                    "label": "Disabled (1 = bypass all Shield checks)",
-                    "type": "string",
-                    "required": true,
-                    "display": "small",
-                    "default": "0"
-                },
-                {
-                    "name": "dry_run",
-                    "field": "dry_run",
-                    "label": "Dry Run (1 = evaluate but never hard-reject)",
-                    "type": "string",
-                    "required": true,
-                    "display": "small",
-                    "default": "1"
-                }
-            ]
-        },
+	{
+	    "id": "behaviour",
+	    "label": "Behaviour",
+	    "fields": [
+		{
+		    "name": "disabled",
+		    "field": "disabled",
+		    "label": "Bypass All Shield Checks",
+		    "type": "choice",
+		    "display": "small",
+		    "default": "0",
+		    "choices": [
+			{"value": "1", "label": "Yes"},
+			{"value": "0", "label": "No"}
+		    ]
+		},
+		{
+		    "name": "dry_run",
+		    "field": "dry_run",
+		    "label": "Dry Run Mode",
+		    "type": "choice",
+		    "display": "small",
+		    "default": "1",
+		    "choices": [
+			{"value": "1", "label": "Yes"},
+			{"value": "0", "label": "No"}
+		    ]
+		}
+	    ]
+	},
         {
             "id": "score",
             "label": "Score Thresholds and Caching",
