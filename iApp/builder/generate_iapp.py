@@ -39,6 +39,61 @@ COMMON_RULE_FILENAME = "MIDEYE_SHIELD_COMMON.tcl"
 STATIC_VAR_PREFIX = "static::MIDEYE_SHIELD_"
 
 
+# Internal substitutions. These are placeholder tokens in the iRule source
+# that are NOT user-form variables, but are computed at iApp deployment time
+# inside the implementation block. Each entry has:
+#
+#   placeholder: the literal token that appears in iRule source files
+#                (e.g. "__partition__") that the generator replaces.
+#
+#   tcl_var:     the name of a TCL variable that the generated implementation
+#                block will define BEFORE the iRule substitution runs. The
+#                _SUBST_MAP entry will read this variable's current value.
+#
+#   setup_code:  one or more lines of TCL code that compute the value of the
+#                tcl_var. Emitted into the implementation block before the
+#                iRule bodies are substituted. May be an empty list when the
+#                variable is just an alias for a user-form setting that the
+#                iApp framework already exposes (e.g. $::infra__hssr_irule).
+#
+# To add a new internal substitution, append an entry here. The generator
+# will:
+#   1. Emit the setup_code lines into the implementation block.
+#   2. Add (placeholder -> $tcl_var) to the _SUBST_MAP.
+#   3. Verify the placeholder is not also defined as a user setting.
+#
+# Order matters: setup_code is emitted in registry order, so later entries
+# may reference TCL variables defined by earlier entries.
+INTERNAL_SUBSTITUTIONS = [
+    {
+        "placeholder": "__partition__",
+        "tcl_var": "_partition",
+        "setup_code": [
+            "# Resolve the partition the iApp is being deployed into so that",
+            "# every fully-qualified iRule call inside the deployed iRules",
+            "# (e.g. call /<partition>/MIDEYE_SHIELD_COMMON::LOG_DEBUG) works",
+            "# regardless of which partition the administrator picks.",
+            "#",
+            "# tmsh::pwd returns something like /Common/MIDEYE_SHIELD.app at",
+            "# deploy time. Splitting on / and taking index 1 yields just the",
+            "# partition name (e.g. 'Common').",
+            "set _partition [lindex [split [tmsh::pwd] /] 1]",
+        ],
+    },
+    {
+        "placeholder": "__hssr_irule__",
+        "tcl_var": "_hssr_irule",
+        "setup_code": [
+            "# The HSSR iRule path is supplied by the administrator in the",
+            "# iApp form (infra section, hssr_irule field). Expose it as a",
+            "# short alias so iRule source files can reference it as",
+            "# __hssr_irule__ instead of the longer __infra__hssr_irule__.",
+            "set _hssr_irule $::infra__hssr_irule",
+        ],
+    },
+]
+
+
 def parse_args():
     # Parse command line arguments using argparse
     parser = argparse.ArgumentParser(
@@ -191,6 +246,7 @@ def collect_setting_names(settings):
                 "display": field.get("display", "medium"),
                 "default": field.get("default", ""),
                 "choices": field.get("choices", []),
+                "runtime": field.get("runtime", True),
             }
 
             result.append(entry)
@@ -198,14 +254,46 @@ def collect_setting_names(settings):
     return result
 
 
+def validate_internal_substitutions(setting_entries):
+    # Check that no internal substitution placeholder collides with a
+    # placeholder that would also be produced by a user setting. If both
+    # were present, [string map] would still work (last write wins) but
+    # the behaviour would be confusing and order-dependent.
+    setting_placeholders = {
+        f'__{e["section_id"]}__{e["field_id"]}__': e["name"]
+        for e in setting_entries
+    }
+
+    for internal in INTERNAL_SUBSTITUTIONS:
+        ph = internal["placeholder"]
+
+        if ph in setting_placeholders:
+            sys.stderr.write(
+                f"ERROR: Internal substitution {ph} collides with user "
+                f"setting '{setting_placeholders[ph]}'. Rename one of them.\n"
+            )
+            sys.exit(6)
+
+
 def cross_check(statics, setting_entries, strict):
     # Compare the names declared in RULE_INIT against the names in settings.
     # Emit warnings to stderr for mismatches in either direction.
+    #
+    # Settings flagged with "runtime": false are deploy-time-substitution-only
+    # values that are baked directly into the iRule source by the generator.
+    # They do not need a RULE_INIT static and are excluded from this check.
     static_names = {name for name, _ in statics}
-    setting_names = {e["name"] for e in setting_entries}
 
-    missing_in_settings = sorted(static_names - setting_names)
-    missing_in_rule_init = sorted(setting_names - static_names)
+    # Only settings that DO expect a RULE_INIT static participate in the
+    # cross-check. By default every setting is treated as runtime=true.
+    runtime_setting_names = {
+        e["name"]
+        for e in setting_entries
+        if e.get("runtime", True)
+    }
+
+    missing_in_settings = sorted(static_names - runtime_setting_names)
+    missing_in_rule_init = sorted(runtime_setting_names - static_names)
 
     had_warnings = False
 
@@ -403,21 +491,43 @@ def build_text_block(setting_entries, settings):
 
 def build_subst_map_entries(setting_entries):
     # Build the list contents that go inside the [list ...] for _SUBST_MAP.
-    # Format: "__section__field__" "$::section__field"
-    # ...repeated for each entry.
+    # Entries fall into two categories:
+    #   1. User-form settings: "__section__field__" -> "$::section__field"
+    #   2. Internal substitutions: "__placeholder__" -> "$_tcl_var"
+    # All placeholders end up in the same map and are resolved by the same
+    # [string map] call inside the implementation block.
     parts = []
 
+    # User-form settings first
     for entry in setting_entries:
         placeholder = f'__{entry["section_id"]}__{entry["field_id"]}__'
         iapp_var = f'$::{entry["section_id"]}__{entry["field_id"]}'
 
-        # Escape the dollar to keep it as a literal in the iApp script string,
-        # but we actually want $:: expansion at runtime, so leave as is.
-        # The [list ...] in TCL takes the elements verbatim; quoting needed.
         parts.append(f'"{placeholder}" "{iapp_var}"')
+
+    # Then internal substitutions (partition, hssr_irule alias, etc.)
+    for entry in INTERNAL_SUBSTITUTIONS:
+        placeholder = entry["placeholder"]
+        tcl_ref = f'${entry["tcl_var"]}'
+
+        parts.append(f'"{placeholder}" "{tcl_ref}"')
 
     # Wrap on multiple lines for readability in the generated file
     return " \\\n    ".join(parts)
+
+
+def build_internal_setup_code():
+    # Build the block of TCL code that computes each internal substitution's
+    # value before the iRule substitution runs. Emitted into the
+    # implementation block at the __IAPP_INTERNAL_SETUP__ marker.
+    lines = []
+
+    for entry in INTERNAL_SUBSTITUTIONS:
+        lines.extend(entry["setup_code"])
+        # Blank line between blocks for readability
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def count_unescaped_quotes(text):
@@ -552,6 +662,7 @@ def generate(shell, setting_entries, settings, rule_files):
     presentation = build_presentation(setting_entries, settings)
     text_block   = build_text_block(setting_entries, settings)
     subst_map    = build_subst_map_entries(setting_entries)
+    internal_setup = build_internal_setup_code()
 
     bodies, var_map = build_irule_bodies(rule_files)
     create_calls = build_irule_create_calls(var_map)
@@ -560,6 +671,7 @@ def generate(shell, setting_entries, settings, rule_files):
         "__IAPP_PRESENTATION__":          presentation,
         "__IAPP_TEXT__":                  text_block,
         "__IAPP_PLACEHOLDER_MAP_ENTRIES__": subst_map,
+        "__IAPP_INTERNAL_SETUP__":        internal_setup,
         "__IAPP_IRULE_BODIES__":          bodies,
         "__IAPP_IRULE_CREATE_CALLS__":    create_calls,
     }
@@ -632,6 +744,10 @@ def main():
     shell    = read_file(args.shell)
     settings = load_settings(args.settings)
     setting_entries = collect_setting_names(settings)
+
+    # Sanity-check that internal placeholders do not collide with user
+    # settings before doing any real work.
+    validate_internal_substitutions(setting_entries)
 
     rule_files = discover_irules(args.rules)
 

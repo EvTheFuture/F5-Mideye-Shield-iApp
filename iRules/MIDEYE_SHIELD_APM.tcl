@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
-# Version : 0.9.1
+# Version : 0.9.2
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-03-20
+# Date    : 2026-05-18
 #
 # Purpose
 # -------
@@ -49,7 +49,7 @@
 #
 # Dependencies - iRules (call targets)
 # -------------------------------------
-#   /Common/MIDEYE_SHIELD_COMMON
+#   /__partition__/MIDEYE_SHIELD_COMMON
 #       Must exist on the BIG-IP. Does not need to be attached to the
 #       Virtual Server - library iRules are called by path reference.
 #
@@ -58,10 +58,10 @@
 when ACCESS_POLICY_AGENT_EVENT {
     # Only act on the validate_ip event triggered from the access profile.
     if {[string toupper [ACCESS::policy agent_id]] == "MIDEYE_SHIELD-VALIDATE_IP"} {
-        set allow [call /Common/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]]
+        set allow [call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]]
         ACCESS::session data set session.custom.shield.allow $allow
 
-        call /Common/UTIL::LOG_DEBUG "Allow status set to '$allow'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Allow status set to '$allow'"
     }
 }
 
@@ -72,9 +72,9 @@ when ACCESS_POLICY_COMPLETED {
         set reason [string tolower [ACCESS::session data get session.custom.shield.reason]]
 
         if {[ACCESS::policy result] == "allow" || $reason == "success"} {
-            call /Common/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "allow"
+            call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "allow"
         } else {
-            call /Common/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "deny"
+            call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "deny"
         }
     }
 }

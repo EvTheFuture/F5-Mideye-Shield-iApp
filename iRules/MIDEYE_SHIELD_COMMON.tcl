@@ -89,7 +89,7 @@
 # -------------------------------------
 #   HSSR  (HTTP Super Sideband Requester)
 #       Called via:
-#           call /__hssr_partition__/HSSR::http_req -uri <url> -virt <helper> [options]
+#           call __hssr_irule__::http_req -uri <url> -virt <helper> [options]
 #       Returns the HTTP status code as an integer.
 #       Response body is received into a named variable via -rbody.
 #       Key options used in this iRule:
@@ -503,7 +503,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "______________ AFTER after"
     # http_req returns the HTTP status code directly.
     # The response body is received into RESP_BODY via -rbody.
     if { [catch {
-        set STATUS [call /__hssr_partition__/HSSR::http_req $ARGS]
+        set STATUS [call __hssr_irule__::http_req $ARGS]
     } ERR] } {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Unable to get valid token -> '$ERR'"
 
@@ -652,7 +652,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== _FETCH_IP_SCORE: Will f
         # http_req returns the HTTP status code directly.
         # The response body is received into RESP_BODY via -rbody.
         if { [catch {
-            set STATUS [call /__hssr_partition__/HSSR::http_req $ARGS]
+            set STATUS [call __hssr_irule__::http_req $ARGS]
         } ERR] } {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
@@ -1036,7 +1036,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== Will HASH: '${SALT}${us
 
         # Fire and forget - catch but discard any error.
         catch {
-            set status [call /__hssr_partition__/HSSR::http_req $ARGS]
+            set status [call __hssr_irule__::http_req $ARGS]
         }
     } err
 

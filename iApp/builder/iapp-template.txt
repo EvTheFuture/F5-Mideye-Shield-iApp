@@ -96,11 +96,21 @@ if { $::hash__username_salt eq "" } {
 }
 
 # ---------------------------------------------------------------------------
+# Internal substitution setup
+#
+# Compute the values of internal placeholder substitutions (e.g. partition
+# name from tmsh::pwd) before the substitution map is built. Each TCL
+# variable defined here is referenced by an entry in _SUBST_MAP below.
+# ---------------------------------------------------------------------------
+__IAPP_INTERNAL_SETUP__
+
+# ---------------------------------------------------------------------------
 # Build placeholder substitution map
 #
-# Every placeholder in the iRule bodies has the form __section__field__ and
-# must map to the iApp variable $::section__field. The map is built once and
-# applied to all iRule bodies below.
+# Every placeholder in the iRule bodies (e.g. __section__field__ for user
+# settings, or __partition__ / __hssr_irule__ for internal substitutions)
+# is mapped to its concrete value here. The map is built once and applied
+# to all iRule bodies below.
 # ---------------------------------------------------------------------------
 set _SUBST_MAP [list __IAPP_PLACEHOLDER_MAP_ENTRIES__]
 

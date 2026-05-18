@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
-# Version : 0.9.1
+# Version : 0.9.2
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-03-20
+# Date    : 2026-05-18
 #
 # Purpose
 # -------
@@ -26,11 +26,11 @@
 #
 # Dependencies - iRules (call targets)
 # -------------------------------------
-#   /Common/MIDEYE_SHIELD_COMMON
+#   /__partition__/MIDEYE_SHIELD_COMMON
 #       Must exist on the BIG-IP. Does not need to be attached to the
 #       Virtual Server - library iRules are called by path reference.
 #
-#   /Common/HSSR  (HTTP Super Sideband Requester)
+#   __hssr_irule__  (HTTP Super Sideband Requester)
 #       Must be applied to the same Virtual Server as this iRule.
 #
 # =============================================================================
@@ -39,7 +39,7 @@ when CLIENT_ACCEPTED {
     # Validate the connecting IP against the Shield.
     # VALIDATE_IP returns 1 to allow, 0 to reject.
     # All logging and counter updates are handled inside VALIDATE_IP.
-    if { ![call /Common/MIDEYE_SHIELD_COMMON::VALIDATE_CONNECTION [IP::client_addr]] } {
+    if { ![call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_CONNECTION [IP::client_addr]] } {
         reject
     }
 }

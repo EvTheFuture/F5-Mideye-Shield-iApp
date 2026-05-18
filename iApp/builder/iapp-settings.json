@@ -13,10 +13,10 @@
                     "type": "choice",
                     "display": "small",
                     "default": "0",
-		    "choices": [
-			{"value": "1", "label": "Yes"},
-			{"value": "0", "label": "No"}
-		    ]
+                    "choices": [
+                        {"value": "1", "label": "Yes"},
+                        {"value": "0", "label": "No"}
+                    ]
                 }
             ]
         },
@@ -107,36 +107,36 @@
                 }
             ]
         },
-	{
-	    "id": "behaviour",
-	    "label": "Behaviour",
-	    "fields": [
-		{
-		    "name": "disabled",
-		    "field": "disabled",
-		    "label": "Bypass All Shield Checks",
-		    "type": "choice",
-		    "display": "small",
-		    "default": "0",
-		    "choices": [
-			{"value": "1", "label": "Yes"},
-			{"value": "0", "label": "No"}
-		    ]
-		},
-		{
-		    "name": "dry_run",
-		    "field": "dry_run",
-		    "label": "Dry Run Mode",
-		    "type": "choice",
-		    "display": "small",
-		    "default": "1",
-		    "choices": [
-			{"value": "1", "label": "Yes"},
-			{"value": "0", "label": "No"}
-		    ]
-		}
-	    ]
-	},
+        {
+            "id": "behaviour",
+            "label": "Behaviour",
+            "fields": [
+                {
+                    "name": "disabled",
+                    "field": "disabled",
+                    "label": "Bypass All Shield Checks",
+                    "type": "choice",
+                    "display": "small",
+                    "default": "0",
+                    "choices": [
+                        {"value": "1", "label": "Yes"},
+                        {"value": "0", "label": "No"}
+                    ]
+                },
+                {
+                    "name": "dry_run",
+                    "field": "dry_run",
+                    "label": "Dry Run Mode",
+                    "type": "choice",
+                    "display": "small",
+                    "default": "1",
+                    "choices": [
+                        {"value": "1", "label": "Yes"},
+                        {"value": "0", "label": "No"}
+                    ]
+                }
+            ]
+        },
         {
             "id": "score",
             "label": "Score Thresholds and Caching",
@@ -215,6 +215,16 @@
                     "required": false,
                     "display": "large",
                     "default": ""
+                },
+                {
+                    "name": "hssr_irule",
+                    "field": "hssr_irule",
+                    "label": "HSSR iRule (full path, e.g. /Common/HSSR)",
+                    "type": "string",
+                    "required": true,
+                    "display": "large",
+                    "default": "/Common/HSSR",
+                    "runtime": false
                 },
                 {
                     "name": "hssr_helper_vs",
