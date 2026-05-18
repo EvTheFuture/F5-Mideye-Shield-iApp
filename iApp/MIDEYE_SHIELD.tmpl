@@ -102,15 +102,20 @@ if { $::hash__username_salt eq "" } {
 # name from tmsh::pwd) before the substitution map is built. Each TCL
 # variable defined here is referenced by an entry in _SUBST_MAP below.
 # ---------------------------------------------------------------------------
-# Resolve the partition the iApp is being deployed into so that
-# every fully-qualified iRule call inside the deployed iRules
-# (e.g. call /<partition>/MIDEYE_SHIELD_COMMON::LOG_DEBUG) works
-# regardless of which partition the administrator picks.
+# Resolve the FULL iApp app-folder path so that fully-qualified
+# iRule call statements inside the deployed iRules can find the
+# procs at runtime. The iApp framework creates iRules inside the
+# app folder (e.g. /Common/MIDEYE_SHIELD.app), NOT directly in
+# the partition root. A bare partition prefix like /Common/ would
+# not resolve, so call statements would fail and the iRules could
+# not be attached to a virtual server.
 #
-# tmsh::pwd returns something like /Common/MIDEYE_SHIELD.app at
-# deploy time. Splitting on / and taking index 1 yields just the
-# partition name (e.g. 'Common').
-set _partition [lindex [split [tmsh::pwd] /] 1]
+# tmsh::pwd returns the app-folder path at deploy time, e.g.
+#   /Common/MIDEYE_SHIELD.app
+# We strip the leading slash so that callers can prefix it with
+# their own /, e.g.  call /__partition__/MIDEYE_SHIELD_COMMON::...
+# becomes  call /Common/MIDEYE_SHIELD.app/MIDEYE_SHIELD_COMMON::...
+set _partition [string trimleft [tmsh::pwd] "/"]
 
 # The HSSR iRule path is supplied by the administrator in the
 # iApp form (infra section, hssr_irule field). Expose it as a
