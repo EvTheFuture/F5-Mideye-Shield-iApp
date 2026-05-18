@@ -1,0 +1,148 @@
+#TMSH-VERSION: 17.5.1.5
+
+cli admin-partitions {
+    update-partition Common
+}
+sys application template /Common/MIDEYE_SHIELD {
+    actions {
+        definition {
+            html-help {
+                <p>Mideye Shield iApp template. Configure the settings below to deploy
+                the three Mideye Shield iRules (MIDEYE_SHIELD_COMMON, MIDEYE_SHIELD_APM,
+                MIDEYE_SHIELD_CONNECTION) together with the supporting data groups
+                (MIDEYE_SHIELD_WHITELIST, MIDEYE_SHIELD_BLACKLIST).</p>
+                <p>On first deployment the whitelist is populated with RFC1918 defaults
+                and the blacklist is created empty. On upgrade, both lists are
+                preserved as-is so any administrator edits survive.</p>
+            }
+            implementation {
+
+# =============================================================================
+# Mideye Shield iApp implementation
+#
+# This block runs every time the iApp is deployed or modified. It:
+#   1. Ensures the WHITELIST and BLACKLIST data groups exist (creating them
+#      with sensible defaults on first run, leaving them untouched on upgrade
+#      so that administrator edits are preserved).
+#   2. Generates a salt for username hashing if the administrator left the
+#      field blank.
+#   3. Builds the three Mideye Shield iRules by taking the iRule bodies that
+#      are embedded as TCL "set" assignments below, then substituting every
+#      __section__field__ placeholder with the corresponding $::section__field
+#      iApp variable, and finally creating or updating each iRule via tmsh.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Data Groups
+#
+# tmsh has no idempotent "create or skip if exists" command, so we test for
+# existence with "tmsh::get_config" inside a catch and only call create on
+# the empty-result path. This makes the iApp upgrade-safe: existing data is
+# never overwritten.
+# ---------------------------------------------------------------------------
+
+# The data groups are created in /Common with "app-service none" so they
+# are NOT owned by this iApp. That makes them safe for administrators to
+# edit directly in the UI / via tmsh without disabling strict-updates on
+# the iApp service itself. The "if not exists" guard below ensures we
+# never overwrite existing content on re-deploy.
+
+# Check if the WHITELIST data group already exists
+if { [catch { tmsh::get_config /ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST } _result] || $_result eq "" } {
+    # First-time deployment, seed with RFC1918 defaults.
+    # app-service none detaches the object from this iApp so it can be
+    # edited freely after deployment.
+    tmsh::create ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip app-service none records add { 10.0.0.0/8 { } 172.16.0.0/20 { } 192.168.0.0/16 { } }
+}
+
+# Check if the BLACKLIST data group already exists
+if { [catch { tmsh::get_config /ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST } _result] || $_result eq "" } {
+    # First-time deployment, create empty blacklist
+    tmsh::create ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip app-service none
+}
+
+# ---------------------------------------------------------------------------
+# Username salt
+#
+# Generate a random salt if the administrator did not supply one. The salt
+# is read back from the running config on re-deploy so the value persists.
+# ---------------------------------------------------------------------------
+if { $::hash__username_salt eq "" } {
+    # Pull existing salt from the current iRule (if any) to avoid regenerating
+    # on every re-deploy, which would invalidate all previously hashed users.
+    set _existing_salt ""
+
+    catch {
+        # Mark-and-sweep converts tmsh::create to tmsh::modify on re-deploy,
+        # so the rule lives in the iApp folder. tmsh::get_config will find
+        # it by short name when run inside the iApp implementation context.
+        set _existing_rule [tmsh::get_config /ltm rule MIDEYE_SHIELD_COMMON]
+        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt
+    }
+
+    if { $_existing_salt ne "" } {
+        set ::hash__username_salt $_existing_salt
+    } else {
+        # Generate a fresh 32-character random salt
+        set _chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        set _salt ""
+
+        for { set _i 0 } { $_i < 32 } { incr _i } {
+            append _salt [string index $_chars [expr { int(rand() * [string length $_chars]) }]]
+        }
+
+        set ::hash__username_salt $_salt
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Build placeholder substitution map
+#
+# Every placeholder in the iRule bodies has the form __section__field__ and
+# must map to the iApp variable $::section__field. The map is built once and
+# applied to all iRule bodies below.
+# ---------------------------------------------------------------------------
+set _SUBST_MAP [list __IAPP_PLACEHOLDER_MAP_ENTRIES__]
+
+# ---------------------------------------------------------------------------
+# iRule bodies
+#
+# The generator script embeds each iRule's TCL source as a "set <name> { ... }"
+# block here. The placeholders inside each body are substituted from the
+# _SUBST_MAP above before the iRule is created.
+# ---------------------------------------------------------------------------
+__IAPP_IRULE_BODIES__
+
+# ---------------------------------------------------------------------------
+# Create or update each iRule
+#
+# tmsh::create is automatically converted to tmsh::modify on iApp re-entry
+# by the BIG-IP "mark-and-sweep" framework, so a single call works for both
+# first deployment and re-deploys. The framework also handles deletion of
+# orphaned objects on iApp delete, so no explicit cleanup is needed.
+# ---------------------------------------------------------------------------
+__IAPP_IRULE_CREATE_CALLS__
+
+            }
+            macro {
+            }
+            presentation {
+
+__IAPP_PRESENTATION__
+
+__IAPP_TEXT__
+
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description "Mideye Shield - IP reputation and login validation"
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min 14.1
+    requires-modules { ltm }
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}

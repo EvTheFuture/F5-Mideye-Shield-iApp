@@ -1,0 +1,222 @@
+{
+    "_comment": "Mideye Shield iApp settings definitions. Each entry describes one configurable variable shown in the iApp UI. The 'name' is the static variable suffix used in RULE_INIT of MIDEYE_SHIELD_COMMON (i.e. static::MIDEYE_SHIELD_<name>). The 'section' and 'field' together form the iApp variable name $::section__field, which is also the placeholder __section__field__ inside the iRule body. The generator cross-checks 'name' against the actual RULE_INIT declarations and warns on any mismatch.",
+
+    "sections": [
+        {
+            "id": "api",
+            "label": "API Settings",
+            "fields": [
+                {
+                    "name": "api_base_url",
+                    "field": "base_url",
+                    "label": "API Base URL",
+                    "type": "string",
+                    "required": true,
+                    "display": "xlarge",
+                    "default": "https://shield.prod.mideye.com/api/v2"
+                },
+                {
+                    "name": "api_client_id",
+                    "field": "client_id",
+                    "label": "API Client ID",
+                    "type": "string",
+                    "required": true,
+                    "display": "xlarge",
+                    "default": ""
+                },
+                {
+                    "name": "api_client_secret",
+                    "field": "client_secret",
+                    "label": "API Client Secret",
+                    "type": "string",
+                    "required": true,
+                    "display": "xlarge",
+                    "default": ""
+                },
+                {
+                    "name": "api_scope",
+                    "field": "scope",
+                    "label": "API OAuth2 Scope",
+                    "type": "string",
+                    "required": true,
+                    "display": "xlarge",
+                    "default": "api://app-mideye-shield-prod/.default"
+                },
+                {
+                    "name": "api_token_url",
+                    "field": "token_url",
+                    "label": "API OAuth2 Token URL",
+                    "type": "string",
+                    "required": true,
+                    "display": "xlarge",
+                    "default": "https://login.prod.mideye.com/oauth2/v2.0/token"
+                },
+                {
+                    "name": "api_timeout",
+                    "field": "timeout",
+                    "label": "API Timeout (ms)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "2500"
+                },
+                {
+                    "name": "api_token_safeguard",
+                    "field": "token_safeguard",
+                    "label": "API Token Safeguard (seconds shaved off token lifetime)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "30"
+                },
+                {
+                    "name": "api_down_cache_time",
+                    "field": "down_cache_time",
+                    "label": "API Down Cache Time (seconds)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "5"
+                },
+                {
+                    "name": "api_retry_after",
+                    "field": "retry_after",
+                    "label": "API Retry After (seconds)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "30"
+                }
+            ]
+        },
+        {
+            "id": "behaviour",
+            "label": "Behaviour",
+            "fields": [
+                {
+                    "name": "disabled",
+                    "field": "disabled",
+                    "label": "Disabled (1 = bypass all Shield checks)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "0"
+                },
+                {
+                    "name": "dry_run",
+                    "field": "dry_run",
+                    "label": "Dry Run (1 = evaluate but never hard-reject)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "1"
+                }
+            ]
+        },
+        {
+            "id": "score",
+            "label": "Score Thresholds and Caching",
+            "fields": [
+                {
+                    "name": "score_hard_deny",
+                    "field": "hard_deny",
+                    "label": "Hard Deny Threshold (score at or above is denied)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "70"
+                },
+                {
+                    "name": "score_warn",
+                    "field": "warn",
+                    "label": "Warn Threshold (score at or above logs a warning)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "40"
+                },
+                {
+                    "name": "score_cache_time",
+                    "field": "cache_time",
+                    "label": "Connection Score Cache Time (seconds)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "300"
+                },
+                {
+                    "name": "login_score_cache_time",
+                    "field": "login_cache_time",
+                    "label": "Login Score Cache Time (seconds)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "10"
+                }
+            ]
+        },
+        {
+            "id": "pending",
+            "label": "Pending Queue",
+            "fields": [
+                {
+                    "name": "pending_max",
+                    "field": "max",
+                    "label": "Max Pending Connections per IP",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "10"
+                },
+                {
+                    "name": "pending_poll_interval",
+                    "field": "poll_interval",
+                    "label": "Pending Poll Interval (ms)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "100"
+                }
+            ]
+        },
+        {
+            "id": "infra",
+            "label": "Infrastructure",
+            "fields": [
+                {
+                    "name": "dns",
+                    "field": "dns",
+                    "label": "DNS Server (IP or Virtual Server, leave empty for default)",
+                    "type": "string",
+                    "required": false,
+                    "display": "large",
+                    "default": ""
+                },
+                {
+                    "name": "hssr_helper_vs",
+                    "field": "hssr_helper_vs",
+                    "label": "HSSR Helper Virtual Server",
+                    "type": "string",
+                    "required": true,
+                    "display": "large",
+                    "default": "/Common/HSSR-helper"
+                }
+            ]
+        },
+        {
+            "id": "hash",
+            "label": "Username Hashing",
+            "fields": [
+                {
+                    "name": "username_salt",
+                    "field": "username_salt",
+                    "label": "Username Salt (leave empty to auto-generate)",
+                    "type": "string",
+                    "required": false,
+                    "display": "xlarge",
+                    "default": ""
+                }
+            ]
+        }
+    ]
+}
