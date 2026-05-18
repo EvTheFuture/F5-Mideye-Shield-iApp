@@ -180,26 +180,24 @@ when RULE_INIT {
 # P R I V A T E   P R O C E D U R E S
 # ===========================================================================
 
-###############################################################
+# ---------------------------------------------------------------------------
+# proc:_LOG_COMMON
 #
-# Name:     _LOG_COMMON
+# DO NOT USE, this is an INTERNAL PROCEDURE
 #
-# Desc:     DO NOT USE, this is an INTERNAL PROCEDURE
+#  level: debug, info, warning, error, alert
+#    msg: Log message
+# noname: true | false (if true, don't log iRule name)
 #
-# Params:
-#  level:   debug, info, warning, error, alert
-#    msg:   Log message
-# noname:   true | false (if true, don't log iRule name)
-#
-# Returns:  void
-#
+# Returns void
+# ---------------------------------------------------------------------------
 proc _LOG_COMMON {level msg {noname false}} {
     set chunk_size 750
 
     set prefix ""
 
-    if {[catch {set prefix "[ACCESS::session data get session.user.display_sessionid]: "}] != ""} {
-        set prefix ""
+    catch {
+        set prefix "[ACCESS::session data get session.user.display_sessionid]: "
     }
 
     if {$prefix == ""} {
@@ -452,7 +450,7 @@ proc _GET_VALID_TOKEN {} {
     set CACHED_TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET "token"]
 
     if {$CACHED_TOKEN != ""} {
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== _GET_VALID_TOKEN: Returning cached token..."
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Returning cached token..."
         return $CACHED_TOKEN
     }
 
@@ -462,7 +460,7 @@ proc _GET_VALID_TOKEN {} {
     set SENTINEL_TTL [expr { int($TIMEOUT / 1000) + 5 }]
     set LOCK_RESULT  [table add -subtable "MIDEYE_SHIELD" "token_fetching" 1 $SENTINEL_TTL indefinite]
 
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== LOCK_RESULT: $LOCK_RESULT"
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "LOCK_RESULT: $LOCK_RESULT"
 
     if { $LOCK_RESULT != 1 } {
         # Another context holds the lock - poll until token appears.
@@ -470,9 +468,8 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== LOCK_RESULT: $LOCK_RESUL
         set POLLS 0
 
         while {$POLLS < $MAX_POLLS} {
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "_____________ BEFORE after"
+            # Wait for lock to release
             after $POLL_INTERVAL
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "______________ AFTER after"
 
             set CACHED_TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET "token"]
 
@@ -484,7 +481,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "______________ AFTER after"
         }
 
         # Timed out waiting for the owning context to complete the fetch.
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "== TIMEOUT WAITING"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "TIMEOUT WAITING for other thread fetching a TOKEN"
         return ""
     }
 
@@ -531,23 +528,23 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "______________ AFTER after"
         return ""
     }
 
-    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== _GET_VALID_TOKEN: GOT A NEW_TOKEN" true
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "GOT A NEW_TOKEN" true
 
     # Parse the exp claim from the token so we honour the server-issued lifetime.
     set EXP [call /__partition__/MIDEYE_SHIELD_COMMON::_PARSE_JWT_EXP $NEW_TOKEN]
 
-    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== _GET_VALID_TOKEN: EXP: '$EXP'"
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "TOKEN EXP: '$EXP'"
 
     if { $EXP == 0 } {
         # Could not parse exp - fall back to a conservative 5-minute cache.
         set EXP [expr { [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_EPOCH] + 300 }]
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== _GET_VALID_TOKEN: Setting default EXP: '$EXP'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Setting default EXP to: '$EXP'"
     }
 
     # Cache the token and its expiry using the remaining token lifetime as TTL.
     set TTL [expr {$EXP - [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_EPOCH] - $SAFEGUARD}]
 
-    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== _GET_VALID_TOKEN: TTL: '$TTL'"
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "TOKEN TTL: '$TTL'"
 
     # Save the new token in the cahce
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_SET "token" $NEW_TOKEN $TTL $TTL
@@ -627,7 +624,7 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
         # The pending key TTL is tied to api_timeout so it self-clears on crash.
         set TIMEOUT_SECS [expr { int($TIMEOUT / 1000) + 1 }]
 
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== _FETCH_IP_SCORE: Will fetch Score for '$SAFE_IP', PEND_VAL: $PEND_VAL"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will fetch Score for '$SAFE_IP', PEND_VAL: $PEND_VAL"
 
         set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
 
@@ -646,7 +643,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== _FETCH_IP_SCORE: Will f
             -headers [list "Authorization" "Bearer ${TOKEN}"] \
             -rbody   RESP_BODY
 
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "==== _FETCH_IP_SCORE: Fetching Score for '$SAFE_IP'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Fetching Score for '$SAFE_IP'"
 
         # Perform the sideband score request via HSSR.
         # http_req returns the HTTP status code directly.
@@ -671,7 +668,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== _FETCH_IP_SCORE: Will f
             return -2
         }
 
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "==== _FETCH_IP_SCORE: RESP_BODY: $RESP_BODY"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Fetch TOKEN RESP_BODY: $RESP_BODY"
 
         # Parse the overall risk score from the JSON response body.
         # The API returns: {"ipAddress":"...","riskScore":{"overall":N,...}}
@@ -685,7 +682,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "==== _FETCH_IP_SCORE: RESP_
             return -2
         }
 
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "==== _FETCH_IP_SCORE: SCORE: $SCORE"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "SCORE: SCORE: '$SCORE' for '$SAFE_IP'"
 
         # Write the resolved score to cache and release the pending key.
         # Use the cache_time supplied by the caller (connection vs login TTL).
@@ -717,7 +714,11 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "==== _FETCH_IP_SCORE: SCORE
         set POLLS 0
 
         set MIDEYE_SHIELD_WAITING 1
-        catch { call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will try POLLS: $MAX_POLLS, TIME: $POLL_INTERVAL) to COLLECT (MAX_" ; eval $TCP_COLLECT ; call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "COLLECT Succeded"}
+        catch {
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will try to COLLECT Data (POLLS: $MAX_POLLS, TIME: $POLL_INTERVAL)"
+            eval $TCP_COLLECT
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "COLLECT Succeded"
+        }
 
         while {$POLLS < $MAX_POLLS} {
             after $POLL_INTERVAL
@@ -776,13 +777,13 @@ proc _VALIDATE { client_ip cache_time } {
     set HARD_DENY_THRESHOLD $static::MIDEYE_SHIELD_score_hard_deny
     set WARN_THRESHOLD      $static::MIDEYE_SHIELD_score_warn
 
-    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE $client_ip $cache_time: DISABLED: $DISABLED"
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE $client_ip $cache_time: DISABLED: $DISABLED"
 
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_requests"
 
     # Disabled flag short-circuits everything - no logging, no checks.
     if {$DISABLED == "1"} {
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE exit branch 1 (Disabled)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 1 (Disabled)"
         return 1
     }
 
@@ -794,14 +795,14 @@ proc _VALIDATE { client_ip cache_time } {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE exit branch 2 (Blacklisted)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 2 (Blacklisted)"
         return 0
     }
 
     # --- Whitelist check ---
     if {[class match $client_ip equals MIDEYE_SHIELD_WHITELIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_whitelisted"
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE exit branch 3 (Whitelisted)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 3 (Whitelisted)"
         return 1
     }
 
@@ -820,14 +821,14 @@ proc _VALIDATE { client_ip cache_time } {
         }
 
         # TODO, config for this?
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE exit branch 5 (Pending Queue FULL)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 5 (Pending Queue FULL)"
         return 0
     }
 
     # API failure or timeout waiting for a score - fail open.
     if {$SCORE == -2} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_apifail"
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE exit branch 6 (API Timeout)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 6 (API Timeout)"
         return 1
     }
 
@@ -837,7 +838,7 @@ proc _VALIDATE { client_ip cache_time } {
 
         if {$DRY_RUN == "1"} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied '$client_ip' due to high score of '$SCORE'"
-            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE exit branch 7 (Dry Run, and HIGH Score)"
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 7 (Dry Run, and HIGH Score)"
             return 1
         }
 
@@ -852,7 +853,7 @@ proc _VALIDATE { client_ip cache_time } {
     }
 
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_score"
-    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "===== INSIDE _VALIDATE main exit (ALLOWED)"
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE main exit (ALLOWED)"
     return 1
 }
 
@@ -1001,7 +1002,7 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
 
         set hashed_user ""
         if {$user != ""} {
-call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== Will HASH: '${SALT}${user}'"
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will HASH: '${SALT}${user}'"
             binary scan [sha512 "${SALT}${user}"] H* hashed_user
         }
 
@@ -1026,7 +1027,6 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== Will HASH: '${SALT}${us
         append BODY "\]"
         append BODY "}"
 
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== Sending body ->$BODY<-"
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
         lappend ARGS \
@@ -1043,7 +1043,7 @@ call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "=== Will HASH: '${SALT}${us
     if {$err != "" && $err != 0} {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Something went wrong when sending result to SHIELD: '$err'"
     } else {
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "== STATUS CODE from /ips/events: '$status'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "STATUS CODE from /ips/events: '$status'"
     }
 }
 

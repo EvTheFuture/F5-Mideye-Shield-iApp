@@ -129,7 +129,7 @@
                     "label": "Dry Run Mode",
                     "type": "choice",
                     "display": "small",
-                    "default": "1",
+                    "default": "0",
                     "choices": [
                         {"value": "1", "label": "Yes"},
                         {"value": "0", "label": "No"}
