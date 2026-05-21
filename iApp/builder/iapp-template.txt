@@ -14,6 +14,18 @@ sys application template /Common/MIDEYE_SHIELD {
                 <p>On first deployment the whitelist is populated with RFC1918 defaults
                 and the blacklist is created empty. On upgrade, both lists are
                 preserved as-is so any administrator edits survive.</p>
+                <p>HSSR Helper: the Mideye Shield iRules use the HTTP Super SIDEBAND
+                Requester (HSSR) to reach the Shield API. Under "HSSR Helper" you can
+                either point the iApp at an existing HSSR iRule and helper virtual
+                server, or have the iApp install a bundled HSSR for you. When you
+                choose "Install for me", the iApp creates the HSSR iRules and a
+                helper virtual server (MIDEYE_SHIELD_HSSR, MIDEYE_SHIELD_HSSR_helper,
+                MIDEYE_SHIELD_HSSR_helper_vs) owned by this application service. They
+                are upgraded automatically when you reconfigure and removed if you
+                delete the service, so do not point other applications at the
+                bundled helper. The helper virtual server uses SNAT automap, is
+                disabled on all VLANs (sideband only), and uses the Server SSL
+                profile you select.</p>
             }
             implementation {
 
@@ -35,40 +47,40 @@ sys application template /Common/MIDEYE_SHIELD {
 # ---------------------------------------------------------------------------
 # Data Groups
 #
-# tmsh has no idempotent "create or skip if exists" command, so we test for
-# existence with "tmsh::get_config" inside a catch and only call create on
-# the empty-result path. This makes the iApp upgrade-safe: existing data is
-# never overwritten.
-# ---------------------------------------------------------------------------
-
-# The data groups are created in /Common and guarded by an existence check,
-# so the iApp never overwrites administrator edits on re-deploy.
+# MARK-AND-SWEEP SAFETY (this is the important part):
+# On reconfigure, the iApp framework re-runs this implementation and then
+# deletes (sweeps) any iApp-owned object that was NOT touched (i.e. not
+# created/modified) during the run. F5 docs state that untouched objects are
+# deleted in the sweep, and that create commands are automatically changed to
+# modify on re-entry.
 #
-# EXISTENCE CHECK:
-# tmsh::get_config behaves in one of two ways when the queried object is
-# absent, depending on version/context: it either throws a TCL error, or it
-# returns an empty result. We treat BOTH as "missing" so the check is robust:
-#   - [catch ...] traps the error case (returns 1 on error).
-#   - On the no-error case we inspect the captured result; an empty/blank
-#     result also means missing.
-# A small helper proc keeps the two if-conditions readable and identical.
-# Note: the module path passed to get_config has NO leading slash before
-# "ltm" (the leading slash belongs only on the /Common/<name> object). An
-# earlier version had a stray leading slash plus a result test with inverted
-# logic, which made the create run every time and never recreate correctly.
+# An earlier version guarded BOTH the create and the records with a single
+# "if missing" check. That meant on reconfigure the create was skipped, the
+# data group became untouched, and mark-and-sweep DELETED it - which then
+# broke the iRule with "Unable to find value_list (MIDEYE_SHIELD_BLACKLIST)".
 #
-# RECORDS / BRACE HANDLING:
-# The create command is passed to tmsh::create as a SINGLE brace-grouped
-# argument: tmsh::create { ltm data-group internal ... records add { ... } }.
+# The fix: ALWAYS issue a create for each data group every run (so it is
+# always touched and never swept), but only include the seed RECORDS on the
+# very first deployment. On reconfigure the create is converted to a modify
+# with no records clause, which touches the object while leaving its existing
+# records - including any administrator edits - completely intact.
+#
+# BRACE HANDLING:
+# Each create is passed to tmsh::create as a SINGLE brace-grouped argument:
+#   tmsh::create { ltm data-group internal ... records add { ... } }
 # Wrapping the whole command in braces hands tmsh the literal text with all
 # inner braces preserved, so tmsh parses it with its own CLI-style parser
-# (the same one that makes the equivalent interactive CLI command work),
-# instead of letting the TCL argument lexer strip the record braces. Passing
-# the record block as a bare (unwrapped) argument is what produced the error
-# "records: required brace is missing".
+# instead of letting the TCL argument lexer strip the record braces (which
+# produced the old "records: required brace is missing" error). These
+# commands contain no runtime variables, so a pure brace literal is correct
+# here. Backslash-escaped braces are only needed when variables must be
+# interpolated into the command, as in the HSSR virtual server command.
+# ---------------------------------------------------------------------------
 
 # Helper: return 1 if the given config object is missing, 0 if it exists.
 # Handles both get_config failure modes (error thrown OR empty result).
+# Note: NO leading slash before "ltm" in the module path (the leading slash
+# belongs only on the /Common/<name> object path).
 proc _MIDEYE_SHIELD_dg_missing { dg_path } {
     if { [catch { set _cfg [tmsh::get_config ltm data-group internal $dg_path] }] } {
         # get_config threw - object does not exist.
@@ -83,16 +95,29 @@ proc _MIDEYE_SHIELD_dg_missing { dg_path } {
     return 0
 }
 
-# Check if the WHITELIST data group already exists
-if { [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_WHITELIST] } {
-    # First-time deployment - seed with RFC1918 defaults.
-    # The entire command is passed as one braced argument (see note above).
+# Capture each group's pre-run existence BEFORE we touch anything, so we know
+# whether to seed default records (first deploy) or just touch the object
+# (reconfigure).
+set _MIDEYE_SHIELD_wl_missing [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_WHITELIST]
+set _MIDEYE_SHIELD_bl_missing [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_BLACKLIST]
+
+# WHITELIST: always create (touch), seed RFC1918 defaults only on first deploy.
+if { $_MIDEYE_SHIELD_wl_missing } {
+    # First-time deployment - create with the default RFC1918 seed records.
     tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip records add { 10.0.0.0/8 { } 172.16.0.0/20 { } 192.168.0.0/16 { } } }
+} else {
+    # Reconfigure - touch the object (create becomes modify, no records
+    # clause) so mark-and-sweep does not delete it, preserving admin edits.
+    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip }
 }
 
-# Check if the BLACKLIST data group already exists
-if { [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_BLACKLIST] } {
+# BLACKLIST: always create (touch). Starts empty; never seed records.
+if { $_MIDEYE_SHIELD_bl_missing } {
     # First-time deployment - create empty blacklist.
+    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
+} else {
+    # Reconfigure - touch the object so mark-and-sweep does not delete it,
+    # preserving any blacklist entries the administrator has added.
     tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
 }
 

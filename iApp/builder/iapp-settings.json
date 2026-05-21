@@ -215,25 +215,81 @@
                     "required": false,
                     "display": "large",
                     "default": ""
+                }
+            ]
+        },
+        {
+            "id": "hssr",
+            "label": "HSSR Helper",
+            "fields": [
+                {
+                    "name": "hssr_mode",
+                    "field": "mode",
+                    "label": "HSSR Helper",
+                    "type": "choice",
+                    "display": "medium",
+                    "default": "existing",
+                    "runtime": false,
+                    "choices": [
+                        {"value": "existing", "label": "Use an existing HSSR helper"},
+                        {"value": "install", "label": "Install an HSSR helper for me"}
+                    ]
                 },
                 {
                     "name": "hssr_irule",
-                    "field": "hssr_irule",
+                    "field": "irule",
                     "label": "HSSR iRule (full path, e.g. /Common/HSSR)",
                     "type": "string",
                     "required": true,
                     "display": "large",
                     "default": "/Common/HSSR",
-                    "runtime": false
+                    "runtime": false,
+                    "optional": "hssr.mode == \"existing\""
                 },
                 {
                     "name": "hssr_helper_vs",
-                    "field": "hssr_helper_vs",
-                    "label": "HSSR Helper Virtual Server",
+                    "field": "helper_vs",
+                    "label": "HSSR Helper Virtual Server (full path)",
                     "type": "string",
                     "required": true,
                     "display": "large",
-                    "default": "/Common/HSSR-helper"
+                    "default": "/Common/HSSR-helper-vs",
+                    "runtime": false,
+                    "optional": "hssr.mode == \"existing\""
+                },
+                {
+                    "name": "hssr_vs_ip",
+                    "field": "vs_ip",
+                    "label": "Helper VS IP address (non-routable recommended, e.g. 192.0.2.2)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "192.0.2.2",
+                    "runtime": false,
+                    "validator": "IpAddress",
+                    "optional": "hssr.mode == \"install\""
+                },
+                {
+                    "name": "hssr_vs_port",
+                    "field": "vs_port",
+                    "label": "Helper VS port",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "9999",
+                    "runtime": false,
+                    "validator": "PortNumber",
+                    "optional": "hssr.mode == \"install\""
+                },
+                {
+                    "name": "hssr_ssl_profile",
+                    "field": "ssl_profile",
+                    "label": "Server SSL Profile for the helper VS",
+                    "type": "ssl_profile_choice",
+                    "display": "large",
+                    "default": "/Common/serverssl",
+                    "runtime": false,
+                    "optional": "hssr.mode == \"install\""
                 }
             ]
         },

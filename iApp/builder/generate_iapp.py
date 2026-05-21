@@ -40,6 +40,33 @@ COMMON_RULE_FILENAME = "MIDEYE_SHIELD_COMMON.tcl"
 STATIC_VAR_PREFIX = "static::MIDEYE_SHIELD_"
 
 
+# Bundled iRules (e.g. HSSR) that the iApp can OPTIONALLY install when the
+# administrator chooses "Install for me". These are embedded verbatim:
+#   - NO __placeholder__ substitution is applied (they have none, and their
+#     own static:: content must pass through untouched).
+#   - They are EXCLUDED from the RULE_INIT settings cross-check (HSSR has its
+#     own RULE_INIT with static::HSSR_* variables unrelated to Mideye).
+#   - They are created only inside the "install" branch of the implementation.
+#
+# The mapping is filename (in the bundled-rules dir) -> the iApp object name
+# the iRule is created as. The object lives inside the iApp app-folder and is
+# owned by the iApp (mark-and-sweep), so re-deploys upgrade it cleanly.
+BUNDLED_RULE_NAMES = {
+    "HSSR.tcl":        "MIDEYE_SHIELD_HSSR",
+    "HSSR-helper.tcl": "MIDEYE_SHIELD_HSSR_helper",
+}
+
+# Name of the helper virtual server created in the "install" branch.
+HSSR_HELPER_VS_NAME = "MIDEYE_SHIELD_HSSR_helper_vs"
+
+# Object name of the helper iRule attached to that virtual server. Must match
+# the value in BUNDLED_RULE_NAMES for HSSR-helper.tcl.
+HSSR_HELPER_RULE_NAME = "MIDEYE_SHIELD_HSSR_helper"
+
+# Object name of the HSSR proc-library iRule. Must match BUNDLED_RULE_NAMES.
+HSSR_RULE_NAME = "MIDEYE_SHIELD_HSSR"
+
+
 # Internal substitutions. These are placeholder tokens in the iRule source
 # that are NOT user-form variables, but are computed at iApp deployment time
 # inside the implementation block. Each entry has:
@@ -90,11 +117,37 @@ INTERNAL_SUBSTITUTIONS = [
         "placeholder": "__hssr_irule__",
         "tcl_var": "_hssr_irule",
         "setup_code": [
-            "# The HSSR iRule path is supplied by the administrator in the",
-            "# iApp form (infra section, hssr_irule field). Expose it as a",
-            "# short alias so iRule source files can reference it as",
-            "# __hssr_irule__ instead of the longer __infra__hssr_irule__.",
-            "set _hssr_irule $::infra__hssr_irule",
+            "# Resolve the HSSR proc-library iRule path, depending on whether the",
+            "# administrator chose to use an existing HSSR or have the iApp install",
+            "# one. In install mode the bundled HSSR lives inside this iApp's",
+            "# app-folder, so we prefix it with the app-folder path (_partition,",
+            "# resolved above). In existing mode we use the admin-supplied path.",
+            "# Optional iApp fields that are hidden do not exist as variables, so",
+            "# every read is guarded with [info exists] (per F5 iApp guidance).",
+            "if { [info exists ::hssr__mode] && $::hssr__mode eq \"install\" } {",
+            "    set _hssr_irule \"/${_partition}/MIDEYE_SHIELD_HSSR\"",
+            "} elseif { [info exists ::hssr__irule] } {",
+            "    set _hssr_irule $::hssr__irule",
+            "} else {",
+            "    set _hssr_irule \"\"",
+            "}",
+        ],
+    },
+    {
+        "placeholder": "__hssr_helper_vs__",
+        "tcl_var": "_hssr_helper_vs",
+        "setup_code": [
+            "# Resolve the HSSR helper virtual server path (passed as -virt to",
+            "# HSSR::http_req). In install mode this is the bundled helper VS in",
+            "# the app-folder; in existing mode it is the admin-supplied path.",
+            "# Hidden optional fields do not exist as variables, so guard reads.",
+            "if { [info exists ::hssr__mode] && $::hssr__mode eq \"install\" } {",
+            "    set _hssr_helper_vs \"/${_partition}/MIDEYE_SHIELD_HSSR_helper_vs\"",
+            "} elseif { [info exists ::hssr__helper_vs] } {",
+            "    set _hssr_helper_vs $::hssr__helper_vs",
+            "} else {",
+            "    set _hssr_helper_vs \"\"",
+            "}",
         ],
     },
 ]
@@ -115,6 +168,18 @@ BUILD_DATE_MARKER_PREFIX = "# IAPP_BUILD_DATE:"
 # numbers (e.g. "5", "1.2", "0.9.11"). Anything outside this shape is rejected
 # so unintentional input like git hashes or release names does not slip in.
 VERSION_PATTERN = re.compile(r"^\d+(\.\d+){0,2}$")
+
+
+# Regex matching the "# Version : X.Y.Z" header line inside an iRule source
+# file. Used to locate the header so a secondary "# iApp Version : <ver>"
+# line can be injected directly after it - in the EMBEDDED copy inside the
+# generated tmpl only. The source file on disk is never modified, and the
+# iRule's own "# Version :" line is preserved as-is. group(1) is the line's
+# leading "# " style prefix so the injected line matches its formatting.
+IRULE_VERSION_LINE_PATTERN = re.compile(
+    r"^(#\s*)Version\s*:\s*\S+\s*$",
+    re.MULTILINE,
+)
 
 
 def read_previous_version(output_path):
@@ -242,6 +307,10 @@ def prompt_or_resolve_version(cli_version, output_path):
                 "interactively or pass --version on the command line.\n"
             )
             sys.exit(7)
+        except KeyboardInterrupt:
+            # Ctrl-C at the prompt: exit cleanly without a traceback.
+            sys.stderr.write("\nAborted by user (no files were changed).\n")
+            sys.exit(130)
 
         # Empty input: only valid when we have a proposed default to fall
         # back to. Without a default, treat it as an invalid entry and
@@ -287,6 +356,15 @@ def parse_args():
         "--rules",
         required=True,
         help="Path to the directory containing iRule .tcl files"
+    )
+
+    parser.add_argument(
+        "--bundled-rules",
+        default=None,
+        help="Path to a directory of bundled iRules (e.g. HSSR) embedded "
+             "verbatim and installed only when the administrator chooses "
+             "'Install for me'. Excluded from placeholder substitution and "
+             "the RULE_INIT settings cross-check."
     )
 
     parser.add_argument(
@@ -427,6 +505,8 @@ def collect_setting_names(settings):
                 "default": field.get("default", ""),
                 "choices": field.get("choices", []),
                 "runtime": field.get("runtime", True),
+                "optional": field.get("optional", None),
+                "validator": field.get("validator", None),
             }
 
             result.append(entry)
@@ -464,6 +544,22 @@ def cross_check(statics, setting_entries, strict):
     # They do not need a RULE_INIT static and are excluded from this check.
     static_names = {name for name, _ in statics}
 
+    # Some RULE_INIT statics are populated from an INTERNAL substitution
+    # placeholder (e.g. set static::..._hssr_helper_vs "__hssr_helper_vs__")
+    # rather than from a user form field. Those are filled by the generator's
+    # internal-substitution machinery and must NOT be reported as "missing a
+    # setting". Detect them by checking whether the static's VALUE is one of
+    # the registered internal-substitution placeholders.
+    internal_placeholders = {
+        entry["placeholder"] for entry in INTERNAL_SUBSTITUTIONS
+    }
+
+    internal_backed_static_names = {
+        name
+        for name, value in statics
+        if value in internal_placeholders
+    }
+
     # Only settings that DO expect a RULE_INIT static participate in the
     # cross-check. By default every setting is treated as runtime=true.
     runtime_setting_names = {
@@ -472,7 +568,12 @@ def cross_check(statics, setting_entries, strict):
         if e.get("runtime", True)
     }
 
-    missing_in_settings = sorted(static_names - runtime_setting_names)
+    # Statics backed by an internal substitution are covered by the generator,
+    # so exclude them from the "declared in RULE_INIT but missing in settings"
+    # direction.
+    missing_in_settings = sorted(
+        static_names - runtime_setting_names - internal_backed_static_names
+    )
     missing_in_rule_init = sorted(runtime_setting_names - static_names)
 
     had_warnings = False
@@ -555,16 +656,35 @@ def build_presentation(setting_entries, settings, meta):
         for entry in section_map[sid]:
             etype = entry["type"]
 
+            # Render the element itself into its own list of lines.
             if etype == "choice":
-                lines.extend(_render_choice(entry))
+                elem_lines = _render_choice(entry)
+            elif etype == "ssl_profile_choice":
+                elem_lines = _render_ssl_profile_choice(entry)
             elif etype == "string":
-                lines.append(_render_string(entry))
+                elem_lines = [_render_string(entry)]
             else:
                 sys.stderr.write(
                     f"WARNING: Unknown type '{etype}' for setting "
                     f"'{entry['name']}', falling back to 'string'.\n"
                 )
-                lines.append(_render_string(entry))
+                elem_lines = [_render_string(entry)]
+
+            # Wrap in an "optional ( <condition> ) { ... }" block if the
+            # field declares an optional condition, so it only appears in the
+            # form when the condition holds (e.g. hssr.mode == "install").
+            cond = entry.get("optional")
+
+            if cond:
+                lines.append(f"    optional ( {cond} ) {{")
+
+                # Indent the element lines one extra level for readability.
+                for el in elem_lines:
+                    lines.append("    " + el)
+
+                lines.append("    }")
+            else:
+                lines.extend(elem_lines)
 
         lines.append("}")
 
@@ -584,7 +704,54 @@ def _render_string(entry):
     default_escaped = entry["default"].replace('"', '\\"')
     parts.append(f' default "{default_escaped}"')
 
+    # Append an APL validator (e.g. IpAddress, PortNumber) when declared.
+    validator = entry.get("validator")
+
+    if validator:
+        parts.append(f' validator "{validator}"')
+
     return "".join(parts)
+
+
+def _render_ssl_profile_choice(entry):
+    # Render a "choice" element whose options are the existing Server SSL
+    # profiles on the box, enumerated at presentation time with a self-
+    # contained tcl { } block (no dependency on the f5.iapp.cli include).
+    #
+    # The APL is:
+    #   choice <field> display "<size>" default "<value>" tcl {
+    #       set objs [tmsh::get_config /ltm profile server-ssl]
+    #       foreach obj $objs {
+    #           append results [tmsh::get_name $obj]
+    #           append results "\n"
+    #       }
+    #       return $results
+    #   }
+    #
+    # The default (e.g. /Common/serverssl) is preselected; the admin can pick
+    # any other serverssl profile from the populated list.
+    field = entry["field_id"]
+    default = entry["default"]
+
+    header = ["    choice ", field, f' display "{entry["display"]}"']
+
+    if default:
+        default_escaped = default.replace('"', '\\"')
+        header.append(f' default "{default_escaped}"')
+
+    header.append(" tcl {")
+
+    lines = ["".join(header)]
+    lines.append("        set results \"\"")
+    lines.append("        set objs [tmsh::get_config /ltm profile server-ssl]")
+    lines.append("        foreach obj $objs {")
+    lines.append("            append results [tmsh::get_name $obj]")
+    lines.append("            append results \"\\n\"")
+    lines.append("        }")
+    lines.append("        return $results")
+    lines.append("    }")
+
+    return lines
 
 
 def _render_choice(entry):
@@ -706,8 +873,16 @@ def build_subst_map_entries(setting_entries):
     # [string map] call inside the implementation block.
     parts = []
 
-    # User-form settings first
+    # User-form settings first. Only runtime settings participate in iRule
+    # placeholder substitution. runtime:false settings (e.g. the HSSR install
+    # fields) are consumed by implementation TCL or by internal substitutions,
+    # never as __section__field__ placeholders in iRule bodies. Critically,
+    # some of them live inside APL "optional" blocks and therefore may not
+    # exist as $::vars at deploy time, so referencing them here would throw.
     for entry in setting_entries:
+        if not entry.get("runtime", True):
+            continue
+
         placeholder = f'__{entry["section_id"]}__{entry["field_id"]}__'
         iapp_var = f'$::{entry["section_id"]}__{entry["field_id"]}'
 
@@ -778,25 +953,59 @@ def find_odd_quote_lines(text):
     return bad
 
 
-def build_irule_bodies(rule_files):
+def inject_iapp_version(body, version):
+    # Insert a "# iApp Version : <version>" comment line into an iRule body,
+    # immediately after the existing "# Version : ..." header line. This is
+    # applied ONLY to the embedded copy that goes into the generated tmpl,
+    # so the iRule's own version (on disk and in the header) is preserved
+    # while the deployed iRule also records which iApp build shipped it.
+    #
+    # The injected line copies the leading "# " style of the matched Version
+    # line so it lines up with the surrounding header. If no "# Version :"
+    # line is found, the body is returned unchanged (with a warning) rather
+    # than guessing where to put the line.
+    m = IRULE_VERSION_LINE_PATTERN.search(body)
+
+    if m is None:
+        sys.stderr.write(
+            "WARNING: No '# Version :' header line found in an iRule body; "
+            "the '# iApp Version :' line was not injected.\n"
+        )
+        return body
+
+    prefix = m.group(1)
+    injected_line = f"{prefix}iApp Version : {version}"
+
+    # Insert the new line right after the matched Version line. m.end() is the
+    # position just before the trailing newline of the matched line, so we
+    # splice in "\n<injected_line>" there.
+    return body[:m.end()] + "\n" + injected_line + body[m.end():]
+
+
+def build_irule_bodies(rule_files, bundled_files=None, version=None):
     # For each iRule file, build a "set <varname> { ... }" block where the
-    # iRule TCL source is embedded verbatim. Returns the full text block.
-    # Also returns a mapping name -> TCL variable name used.
+    # iRule TCL source is embedded verbatim. Returns the full text block plus
+    # two name->varname maps: one for the main (substituted) rules and one
+    # for the bundled (verbatim, no-substitution) rules.
+    #
+    # Main rules: object name derived from filename, body later has the
+    #   _SUBST_MAP applied to it (placeholders -> values). When a version is
+    #   supplied, a "# iApp Version : <version>" line is injected into the
+    #   EMBEDDED copy only (the source file on disk is never modified).
+    # Bundled rules (e.g. HSSR): object name comes from BUNDLED_RULE_NAMES,
+    #   body is embedded verbatim and NEVER has the subst map applied (HSSR
+    #   has no Mideye placeholders and its own static:: content must survive
+    #   untouched), and NEVER gets the iApp version line (third-party).
+    #   Created only in the "install" branch.
+    if bundled_files is None:
+        bundled_files = []
+
     blocks = []
     var_map = {}
+    bundled_var_map = {}
 
-    for path in rule_files:
-        filename = os.path.basename(path)
-        rule_name = filename[:-4] if filename.endswith(".tcl") else filename
-
-        # The TCL variable holding the iRule body. Lowercase for convention.
-        var_name = "_BODY_" + rule_name
-        var_map[rule_name] = var_name
-
-        body = read_file(path)
-
-        # Sanity check: braces must be balanced or the "set var { ... }" form
-        # will fail at iApp deployment with a hard-to-debug TCL parse error.
+    # Helper that runs the brace/quote safety checks shared by both kinds.
+    def _check_body(filename, body):
         if body.count("{") != body.count("}"):
             sys.stderr.write(
                 f"ERROR: Unbalanced braces in {filename}: "
@@ -805,12 +1014,6 @@ def build_irule_bodies(rule_files):
             )
             sys.exit(3)
 
-        # Sanity check: each line should have an even number of unescaped
-        # double quotes, otherwise tmsh's outer parser loses string-context
-        # tracking when it parses the iApp implementation block. The result
-        # is a cryptic "Missing RCURLY" error at template import time.
-        # Fix offending lines by adding a balancing comment such as
-        #     ;# trailing " to keep quote count even
         odd_lines = find_odd_quote_lines(body)
 
         if odd_lines:
@@ -832,24 +1035,71 @@ def build_irule_bodies(rule_files):
             )
             sys.exit(4)
 
-        # Use {*}... braces. Comments lead with #, which inside a braced
-        # string is just text, so no escaping needed.
+    # ----- Main iRules (substituted) -----
+    for path in rule_files:
+        filename = os.path.basename(path)
+        rule_name = filename[:-4] if filename.endswith(".tcl") else filename
+
+        var_name = "_BODY_" + rule_name
+        var_map[rule_name] = var_name
+
+        body = read_file(path)
+        _check_body(filename, body)
+
+        # Inject the iApp build version into the embedded copy only. The
+        # source file on disk is untouched; the iRule keeps its own version.
+        if version is not None:
+            body = inject_iapp_version(body, version)
+
         block = (
             f"# ----- iRule body: {rule_name} -----\n"
             f"set {var_name} {{\n{body}\n}}\n"
         )
-
         blocks.append(block)
 
-    return "\n".join(blocks), var_map
+    # ----- Bundled iRules (verbatim, no substitution) -----
+    for path in bundled_files:
+        filename = os.path.basename(path)
+
+        if filename not in BUNDLED_RULE_NAMES:
+            sys.stderr.write(
+                f"WARNING: Bundled rule file '{filename}' is not in "
+                f"BUNDLED_RULE_NAMES; skipping. Add a mapping to embed it.\n"
+            )
+            continue
+
+        rule_name = BUNDLED_RULE_NAMES[filename]
+        var_name = "_BODY_" + rule_name
+        bundled_var_map[rule_name] = var_name
+
+        body = read_file(path)
+        _check_body(filename, body)
+
+        block = (
+            f"# ----- bundled iRule body (verbatim): {rule_name} "
+            f"(from {filename}) -----\n"
+            f"set {var_name} {{\n{body}\n}}\n"
+        )
+        blocks.append(block)
+
+    return "\n".join(blocks), var_map, bundled_var_map
 
 
-def build_irule_create_calls(var_map):
-    # For each iRule, emit the TCL to apply substitutions and create the
-    # iRule via tmsh::create. The iApp framework converts tmsh::create to
-    # tmsh::modify on re-entry (mark-and-sweep), so we do NOT need a
-    # tmsh::delete here. Calling delete would actually break the mark-and-
-    # sweep tracking and cause unnecessary disruption.
+def build_irule_create_calls(var_map, bundled_var_map=None):
+    # Emit the TCL that creates each iRule.
+    #
+    # Main rules: apply the _SUBST_MAP, then tmsh::create. The iApp framework
+    # converts create->modify on re-entry (mark-and-sweep), so no delete is
+    # needed.
+    #
+    # Bundled rules + the HSSR helper virtual server: created ONLY when the
+    # administrator chose "Install for me" (hssr.mode == install). They are
+    # iApp-owned (plain create inside the app-folder, no app-service none),
+    # so re-deploys upgrade them and deleting the iApp removes them. No
+    # _SUBST_MAP is applied to bundled bodies (verbatim HSSR).
+    if bundled_var_map is None:
+        bundled_var_map = {}
+
     lines = []
 
     for rule_name, var_name in var_map.items():
@@ -862,18 +1112,70 @@ def build_irule_create_calls(var_map):
         )
         lines.append("")
 
+    if bundled_var_map:
+        lines.append("# ----- Optional HSSR helper install -----")
+        lines.append("# Only when the administrator chose 'Install for me'.")
+        lines.append("# These objects are iApp-owned (created inside the app")
+        lines.append("# folder), so mark-and-sweep upgrades them on re-deploy")
+        lines.append("# and removes them when the iApp is deleted.")
+        lines.append("if { $::hssr__mode eq \"install\" } {")
+
+        # Create each bundled iRule verbatim (no substitution).
+        for rule_name, var_name in bundled_var_map.items():
+            lines.append(f"    # Deploy bundled iRule: {rule_name}")
+            lines.append(f"    tmsh::create ltm rule {rule_name} ${var_name}")
+            lines.append("")
+
+        # Create the helper virtual server. We build the command SPEC (without
+        # the tmsh::create prefix) as a single string with the runtime form
+        # values interpolated, then pass it to tmsh::create as ONE argument.
+        #
+        # Why not eval: eval re-parses the whole string as a command line and
+        # strips one level of the brace blocks before tmsh sees them, which
+        # produces "profiles: required brace is missing". Passing the spec as
+        # a single argument to tmsh::create instead lets tmsh parse the braces
+        # itself with its CLI-style parser (the same approach that fixed the
+        # data-group create). The structural braces are written as \{ and \}
+        # so they remain literal characters in the interpolated string.
+        #
+        # Resulting argument (with values filled in), e.g.:
+        #   ltm virtual MIDEYE_SHIELD_HSSR_helper_vs
+        #     destination 192.0.2.2:9999 mask 255.255.255.255 ip-protocol tcp
+        #     profiles add { tcp { } http { } /Common/serverssl { context serverside } }
+        #     rules { MIDEYE_SHIELD_HSSR_helper }
+        #     source-address-translation { type automap }
+        #     translate-address enabled translate-port enabled vlans-disabled
+        lines.append("    # Build the VS command spec (no tmsh::create prefix) as")
+        lines.append("    # a single string with the form values interpolated, then")
+        lines.append("    # pass it to tmsh::create as ONE argument so tmsh parses")
+        lines.append("    # the brace blocks itself (do NOT eval - that strips the")
+        lines.append("    # braces and tmsh reports a missing required brace).")
+        lines.append("    set _hssr_vs_cmd \"ltm virtual " + HSSR_HELPER_VS_NAME + "\"")
+        lines.append("    append _hssr_vs_cmd \" destination $::hssr__vs_ip:$::hssr__vs_port\"")
+        lines.append("    append _hssr_vs_cmd \" mask 255.255.255.255 ip-protocol tcp\"")
+        lines.append("    append _hssr_vs_cmd \" profiles add \\{ tcp \\{ \\} http \\{ \\} $::hssr__ssl_profile \\{ context serverside \\} \\}\"")
+        lines.append("    append _hssr_vs_cmd \" rules \\{ " + HSSR_HELPER_RULE_NAME + " \\}\"")
+        lines.append("    append _hssr_vs_cmd \" source-address-translation \\{ type automap \\}\"")
+        lines.append("    append _hssr_vs_cmd \" translate-address enabled translate-port enabled vlans-disabled\"")
+        lines.append("")
+        lines.append("    tmsh::create $_hssr_vs_cmd")
+        lines.append("}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
-def generate(shell, setting_entries, settings, rule_files, meta):
+def generate(shell, setting_entries, settings, rule_files, meta, bundled_files=None):
     # Build all the substitution blocks and inject them into the shell.
     presentation = build_presentation(setting_entries, settings, meta)
     text_block   = build_text_block(setting_entries, settings, meta)
     subst_map    = build_subst_map_entries(setting_entries)
     internal_setup = build_internal_setup_code()
 
-    bodies, var_map = build_irule_bodies(rule_files)
-    create_calls = build_irule_create_calls(var_map)
+    bodies, var_map, bundled_var_map = build_irule_bodies(
+        rule_files, bundled_files, meta["version"]
+    )
+    create_calls = build_irule_create_calls(var_map, bundled_var_map)
 
     replacements = {
         "__IAPP_PRESENTATION__":          presentation,
@@ -1049,9 +1351,17 @@ def main():
         )
         sys.exit(1)
 
-    # Extract and cross-check
+    # Extract and cross-check. Bundled rules (HSSR) are NOT part of the
+    # rule_files passed here, so their own RULE_INIT statics are never
+    # cross-checked against the Mideye settings.
     statics = extract_rule_init_statics(common_path)
     cross_check(statics, setting_entries, args.strict)
+
+    # Discover bundled rules (e.g. HSSR) if a directory was supplied.
+    bundled_files = []
+
+    if args.bundled_rules:
+        bundled_files = discover_irules(args.bundled_rules)
 
     # Resolve the version: either taken from --version, or read from the
     # previous output and proposed as the bumped default to the user. The
@@ -1070,7 +1380,9 @@ def main():
     }
 
     # Generate the final tmpl
-    output = generate(shell, setting_entries, settings, rule_files, meta)
+    output = generate(
+        shell, setting_entries, settings, rule_files, meta, bundled_files
+    )
 
     # Write the output file
     with open(args.output, "w", encoding="utf-8") as f:
@@ -1079,9 +1391,17 @@ def main():
     sys.stderr.write(
         f"Wrote {args.output} ({len(output)} bytes, version {version}, "
         f"built {build_date}, {len(rule_files)} iRule(s), "
+        f"{len(bundled_files)} bundled iRule(s), "
         f"{len(setting_entries)} setting(s)).\n"
     )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Backstop for Ctrl-C anywhere outside the version prompt (which has
+        # its own handler). Exit cleanly with the conventional 130 status
+        # instead of dumping a traceback.
+        sys.stderr.write("\nAborted by user (no files were changed).\n")
+        sys.exit(130)

@@ -170,7 +170,7 @@ when RULE_INIT {
 
     # Infrastructure
     set static::MIDEYE_SHIELD_dns                    "__infra__dns__"
-    set static::MIDEYE_SHIELD_hssr_helper_vs         "__infra__hssr_helper_vs__"
+    set static::MIDEYE_SHIELD_hssr_helper_vs         "__hssr_helper_vs__"
 
     # Hashing
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
