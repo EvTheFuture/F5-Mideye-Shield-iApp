@@ -1,4 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
+# IAPP_VERSION: 0.10.5
+# IAPP_BUILD_DATE: 2026-05-21 18:09
 
 cli admin-partitions {
     update-partition Common
@@ -41,24 +43,59 @@ sys application template /Common/MIDEYE_SHIELD {
 # never overwritten.
 # ---------------------------------------------------------------------------
 
-# The data groups are created in /Common with "app-service none" so they
-# are NOT owned by this iApp. That makes them safe for administrators to
-# edit directly in the UI / via tmsh without disabling strict-updates on
-# the iApp service itself. The "if not exists" guard below ensures we
-# never overwrite existing content on re-deploy.
+# The data groups are created in /Common and guarded by an existence check,
+# so the iApp never overwrites administrator edits on re-deploy.
+#
+# EXISTENCE CHECK:
+# tmsh::get_config behaves in one of two ways when the queried object is
+# absent, depending on version/context: it either throws a TCL error, or it
+# returns an empty result. We treat BOTH as "missing" so the check is robust:
+#   - [catch ...] traps the error case (returns 1 on error).
+#   - On the no-error case we inspect the captured result; an empty/blank
+#     result also means missing.
+# A small helper proc keeps the two if-conditions readable and identical.
+# Note: the module path passed to get_config has NO leading slash before
+# "ltm" (the leading slash belongs only on the /Common/<name> object). An
+# earlier version had a stray leading slash plus a result test with inverted
+# logic, which made the create run every time and never recreate correctly.
+#
+# RECORDS / BRACE HANDLING:
+# The create command is passed to tmsh::create as a SINGLE brace-grouped
+# argument: tmsh::create { ltm data-group internal ... records add { ... } }.
+# Wrapping the whole command in braces hands tmsh the literal text with all
+# inner braces preserved, so tmsh parses it with its own CLI-style parser
+# (the same one that makes the equivalent interactive CLI command work),
+# instead of letting the TCL argument lexer strip the record braces. Passing
+# the record block as a bare (unwrapped) argument is what produced the error
+# "records: required brace is missing".
+
+# Helper: return 1 if the given config object is missing, 0 if it exists.
+# Handles both get_config failure modes (error thrown OR empty result).
+proc _MIDEYE_SHIELD_dg_missing { dg_path } {
+    if { [catch { set _cfg [tmsh::get_config ltm data-group internal $dg_path] }] } {
+        # get_config threw - object does not exist.
+        return 1
+    }
+
+    if { [string trim $_cfg] eq "" } {
+        # get_config returned nothing - object does not exist.
+        return 1
+    }
+
+    return 0
+}
 
 # Check if the WHITELIST data group already exists
-if { [catch { tmsh::get_config /ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST } _result] || $_result eq "" } {
-    # First-time deployment, seed with RFC1918 defaults.
-    # app-service none detaches the object from this iApp so it can be
-    # edited freely after deployment.
-    tmsh::create ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip app-service none records add { 10.0.0.0/8 { } 172.16.0.0/20 { } 192.168.0.0/16 { } }
+if { [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_WHITELIST] } {
+    # First-time deployment - seed with RFC1918 defaults.
+    # The entire command is passed as one braced argument (see note above).
+    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip records add { 10.0.0.0/8 { } 172.16.0.0/20 { } 192.168.0.0/16 { } } }
 }
 
 # Check if the BLACKLIST data group already exists
-if { [catch { tmsh::get_config /ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST } _result] || $_result eq "" } {
-    # First-time deployment, create empty blacklist
-    tmsh::create ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip app-service none
+if { [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_BLACKLIST] } {
+    # First-time deployment - create empty blacklist.
+    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
 }
 
 # ---------------------------------------------------------------------------
@@ -1259,12 +1296,12 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
             binary scan [sha512 "${SALT}${user}"] H* hashed_user
         }
 
-        set BODY    "{"
+        set BODY    "\{"
         append BODY "\"events\": \["
-        append BODY "{"
+        append BODY "\{"
         append BODY "\"ipAddress\":\"${client_ip}\""
         append BODY ",\"observedAt\": \"[clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]\""
-        append BODY ",\"authentication\": {"
+        append BODY ",\"authentication\": \{"
         append BODY "\"outcome\": \"$outcome\""
 
         if {$hashed_user != ""} {
@@ -1275,10 +1312,10 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
             append BODY ",\"method\": \"$method\""
         }
 
-        append BODY "}"
-        append BODY "}"
+        append BODY "\}"
+        append BODY "\}"
         append BODY "\]"
-        append BODY "}"
+        append BODY "\}"
 
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
@@ -1452,6 +1489,10 @@ tmsh::create ltm rule MIDEYE_SHIELD_CONNECTION $_BODY_MIDEYE_SHIELD_CONNECTION
             }
             presentation {
 
+section about {
+    message version
+    message build_date
+}
 section log {
     choice debug display "small" default "0" {
         "Yes" => "1",
@@ -1499,6 +1540,9 @@ section hash {
 }
 
 text {
+    about                     "About"
+    about.version             "Version: 0.10.5"
+    about.build_date          "Build date: 2026-05-21 18:09"
     log                       "Debug"
     log.debug                 "Enable Debug Logging"
     api                       "API Settings"

@@ -24,6 +24,7 @@
 # =============================================================================
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -99,6 +100,171 @@ INTERNAL_SUBSTITUTIONS = [
 ]
 
 
+# Marker line written into the generated tmpl so the next run can read back
+# the previous version. Kept as a TCL comment so tmsh ignores it but a
+# simple regex can find it. Placed right after the #TMSH-VERSION header.
+VERSION_MARKER_PREFIX = "# IAPP_VERSION:"
+
+
+# Marker line written into the generated tmpl recording when the file was
+# generated. Display-only, parallel to the version marker.
+BUILD_DATE_MARKER_PREFIX = "# IAPP_BUILD_DATE:"
+
+
+# Regex matching a valid version string. Accepts 1-, 2- or 3-component dotted
+# numbers (e.g. "5", "1.2", "0.9.11"). Anything outside this shape is rejected
+# so unintentional input like git hashes or release names does not slip in.
+VERSION_PATTERN = re.compile(r"^\d+(\.\d+){0,2}$")
+
+
+def read_previous_version(output_path):
+    # Try to read the version that was embedded in a previous generation of
+    # the output file. Returns the version string if found, or None if the
+    # file does not exist, cannot be read, or contains no version marker.
+    #
+    # The previous file is treated as best-effort context, not as a hard
+    # dependency, so any failure here returns None rather than raising.
+    if not os.path.isfile(output_path):
+        return None
+
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            # Only scan the first ~40 lines. The marker is always near the
+            # top, and bailing out early avoids parsing the whole file just
+            # to discover that it has no marker.
+            for i, line in enumerate(f):
+                if i > 40:
+                    break
+
+                m = re.match(
+                    r"^\s*" + re.escape(VERSION_MARKER_PREFIX) + r"\s*(\S+)",
+                    line,
+                )
+
+                if m:
+                    candidate = m.group(1)
+
+                    if VERSION_PATTERN.match(candidate):
+                        return candidate
+
+                    # Marker exists but value is malformed: warn but treat
+                    # as if no previous version was found, so the user is
+                    # forced to supply one explicitly via --version.
+                    sys.stderr.write(
+                        f"WARNING: Found a {VERSION_MARKER_PREFIX} marker in "
+                        f"{output_path} but its value '{candidate}' is not a "
+                        f"valid version string. Ignoring it.\n"
+                    )
+                    return None
+    except OSError as e:
+        sys.stderr.write(
+            f"WARNING: Could not read previous version from {output_path}: "
+            f"{e}. Continuing as if no previous version exists.\n"
+        )
+
+    return None
+
+
+def bump_version(previous):
+    # Given a previous version string like "1.2.3" return the next version
+    # by incrementing the last component. Components shorter than 3 are
+    # extended (e.g. "1.2" -> "1.2.1", "5" -> "5.1"). Returns None if the
+    # input is not parseable.
+    if previous is None:
+        return None
+
+    if not VERSION_PATTERN.match(previous):
+        return None
+
+    parts = [int(p) for p in previous.split(".")]
+
+    # Normalise to 3 components so the bump always touches the patch level.
+    # A user starting with "1.2" gets "1.2.1", not "1.3".
+    while len(parts) < 3:
+        parts.append(0)
+
+    parts[-1] += 1
+
+    return ".".join(str(p) for p in parts)
+
+
+def prompt_or_resolve_version(cli_version, output_path):
+    # Determine the version string to embed in this build.
+    #
+    # Resolution order:
+    #   1. If --version was passed on the command line, validate and use it.
+    #      An invalid value exits the script (non-interactive context, so
+    #      re-prompting would not make sense).
+    #   2. Otherwise, prompt the user. If a previous version exists in the
+    #      output file, the bumped version is offered as a default that the
+    #      user accepts by pressing Enter. If no previous version exists,
+    #      the user must type one.
+    #   3. The prompt loops on any invalid entry until a valid version is
+    #      given. EOF (Ctrl-D / closed stdin) exits the script.
+    #
+    # Returns the validated version string.
+    if cli_version is not None:
+        if not VERSION_PATTERN.match(cli_version):
+            sys.stderr.write(
+                f"ERROR: --version value '{cli_version}' is not a valid "
+                f"version string. Expected something like '1.2.3'.\n"
+            )
+            sys.exit(7)
+
+        return cli_version
+
+    previous = read_previous_version(output_path)
+    proposed = bump_version(previous)
+
+    # Show the previous version on its own line as informational context.
+    # This is printed once before entering the input loop.
+    if previous is not None:
+        sys.stderr.write(f"Previous version: {previous}\n")
+
+    # Standard shell-style prompt: "Enter new version [<default>]: "
+    # Only include the bracketed default when we have one to offer.
+    if proposed is not None:
+        prompt = f"Enter new version [{proposed}]: "
+    else:
+        prompt = "Enter new version: "
+
+    # Loop until we get a valid version. Invalid input prints an error and
+    # re-prompts; EOF exits the script.
+    while True:
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+
+        try:
+            entered = input().strip()
+        except EOFError:
+            sys.stderr.write(
+                "\nERROR: stdin closed without input. Either run "
+                "interactively or pass --version on the command line.\n"
+            )
+            sys.exit(7)
+
+        # Empty input: only valid when we have a proposed default to fall
+        # back to. Without a default, treat it as an invalid entry and
+        # re-prompt rather than silently picking something.
+        if entered == "":
+            if proposed is not None:
+                return proposed
+
+            sys.stderr.write(
+                "ERROR: A version is required (no previous version was "
+                "detected to bump from).\n"
+            )
+            continue
+
+        if VERSION_PATTERN.match(entered):
+            return entered
+
+        sys.stderr.write(
+            f"ERROR: '{entered}' is not a valid version string. Expected "
+            f"something like '1.2.3'.\n"
+        )
+
+
 def parse_args():
     # Parse command line arguments using argparse
     parser = argparse.ArgumentParser(
@@ -106,9 +272,9 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--shell",
+        "--template",
         required=True,
-        help="Path to the iApp shell file containing __IAPP_*__ markers"
+        help="Path to the iApp shell template file containing __IAPP_*__ markers"
     )
 
     parser.add_argument(
@@ -127,6 +293,15 @@ def parse_args():
         "--output",
         required=True,
         help="Path to write the generated .tmpl file"
+    )
+
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="Version string to embed in the generated tmpl (e.g. 1.2.3). "
+             "If omitted, the script reads the previous version from the "
+             "existing output file, bumps the patch component, and asks "
+             "interactively for confirmation."
     )
 
     parser.add_argument(
@@ -335,7 +510,7 @@ def cross_check(statics, setting_entries, strict):
         )
 
 
-def build_presentation(setting_entries, settings):
+def build_presentation(setting_entries, settings, meta):
     # Build the APL block that goes inside presentation { ... }.
     # Supported element types:
     #   string  -> "string field [required] display "<size>" default "<value>""
@@ -343,10 +518,23 @@ def build_presentation(setting_entries, settings):
     #                   "<label1>" => "<value1>",
     #                   "<label2>" => "<value2>"
     #               }"
+    #   message -> "message field" (used here for read-only version/build date)
     # Reference for the choice syntax:
     #   https://clouddocs.f5.com/api/iapps/choice.html
+    #
+    # An auto-generated "about" section is prepended with two read-only
+    # message fields showing the template version and build date. These come
+    # from the meta dict and are NOT listed in iapp-settings.json on purpose,
+    # so the generator owns them outright.
     lines = []
 
+    # ----- Auto-generated "about" section (version, build date) -----
+    lines.append("section about {")
+    lines.append("    message version")
+    lines.append("    message build_date")
+    lines.append("}")
+
+    # ----- User-defined sections from iapp-settings.json -----
     # Group entries back into sections in the original order
     seen_sections = []
     section_map = {}
@@ -452,8 +640,11 @@ def _render_choice(entry):
     return lines
 
 
-def build_text_block(setting_entries, settings):
+def build_text_block(setting_entries, settings, meta):
     # Build the text { ... } block that maps section.field paths to UI labels.
+    #
+    # The auto-generated "about" section is emitted first with the version
+    # and build_date strings as their displayed text.
     lines = ["text {"]
 
     # First pass: emit section labels (one per section)
@@ -465,8 +656,8 @@ def build_text_block(setting_entries, settings):
         section_labels[section["id"]] = section["label"]
 
     # Calculate column width so labels align nicely
-    # Find the widest "section.field" path
-    paths = []
+    # Find the widest "section.field" path, including the about section
+    paths = ["about", "about.version", "about.build_date"]
 
     for sid in seen_sections:
         paths.append(sid)
@@ -476,6 +667,18 @@ def build_text_block(setting_entries, settings):
 
     width = max(len(p) for p in paths) + 4
 
+    # ----- Auto-generated "about" section text -----
+    # The labels here are what the iApp UI actually displays to the admin.
+    # Escape any double quotes in the version or build_date defensively
+    # even though the validators upstream should prevent them.
+    version_value = meta["version"].replace('"', '\\"')
+    build_value   = meta["build_date"].replace('"', '\\"')
+
+    lines.append(f'    {"about".ljust(width)}"About"')
+    lines.append(f'    {"about.version".ljust(width)}"Version: {version_value}"')
+    lines.append(f'    {"about.build_date".ljust(width)}"Build date: {build_value}"')
+
+    # ----- User-defined section labels -----
     # Emit one line per section, then per field
     for sid in seen_sections:
         label = section_labels[sid].replace('"', '\\"')
@@ -662,10 +865,10 @@ def build_irule_create_calls(var_map):
     return "\n".join(lines)
 
 
-def generate(shell, setting_entries, settings, rule_files):
+def generate(shell, setting_entries, settings, rule_files, meta):
     # Build all the substitution blocks and inject them into the shell.
-    presentation = build_presentation(setting_entries, settings)
-    text_block   = build_text_block(setting_entries, settings)
+    presentation = build_presentation(setting_entries, settings, meta)
+    text_block   = build_text_block(setting_entries, settings, meta)
     subst_map    = build_subst_map_entries(setting_entries)
     internal_setup = build_internal_setup_code()
 
@@ -691,6 +894,31 @@ def generate(shell, setting_entries, settings, rule_files):
             )
 
         result = result.replace(marker, value)
+
+    # Inject the IAPP_VERSION and IAPP_BUILD_DATE marker lines near the top
+    # of the generated file. They are TCL comments so tmsh ignores them at
+    # import time, but the next run of this generator reads back the version
+    # via read_previous_version() to propose the bumped default.
+    #
+    # The markers go right after the leading #TMSH-VERSION: comment to keep
+    # them visible without disrupting the document structure.
+    version_line = f"{VERSION_MARKER_PREFIX} {meta['version']}"
+    build_line   = f"{BUILD_DATE_MARKER_PREFIX} {meta['build_date']}"
+
+    tmsh_header_match = re.match(r"^(#TMSH-VERSION:[^\n]*\n)", result)
+
+    if tmsh_header_match is not None:
+        # Insert the markers immediately after the #TMSH-VERSION: line.
+        insert_at = tmsh_header_match.end()
+        result = (
+            result[:insert_at]
+            + version_line + "\n"
+            + build_line + "\n"
+            + result[insert_at:]
+        )
+    else:
+        # No #TMSH-VERSION: header found, just prepend the markers.
+        result = version_line + "\n" + build_line + "\n" + result
 
     # Final safety check on the assembled output. The iRule bodies were
     # already checked individually, but the shell text itself (or the
@@ -739,6 +967,55 @@ def generate(shell, setting_entries, settings, rule_files):
             )
             sys.exit(5)
 
+    # Final brace-balance check on the entire assembled template. tmsh uses
+    # brace nesting to delimit every block (actions, definition, html-help,
+    # implementation, presentation, ...), so a single stray { or } anywhere
+    # (even inside a TCL comment, since tmsh's outer parser does not honour
+    # TCL comments) shifts the whole structure and produces errors like
+    # "Missing RCURLY" at import time. We count every brace, then walk to
+    # report where the imbalance first becomes visible.
+    total_open = result.count("{")
+    total_close = result.count("}")
+
+    if total_open != total_close:
+        # Walk to find the first line where running depth goes negative
+        # (an unmatched close) for a more actionable hint. If depth never
+        # goes negative, the imbalance is an unmatched open somewhere.
+        depth = 0
+        first_negative_line = None
+
+        for i, ch in enumerate(result):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+
+                if depth < 0 and first_negative_line is None:
+                    first_negative_line = result[:i].count("\n") + 1
+                    break
+
+        sys.stderr.write(
+            f"ERROR: The generated tmpl has unbalanced braces "
+            f"({total_open} open vs {total_close} close). tmsh will fail to "
+            f"parse it. A common cause is a stray brace inside a comment in "
+            f"the iApp shell template (iapp-template.txt) - tmsh counts those "
+            f"too.\n"
+        )
+
+        if first_negative_line is not None:
+            sys.stderr.write(
+                f"First unmatched closing brace near generated tmpl line "
+                f"{first_negative_line}.\n"
+            )
+        else:
+            sys.stderr.write(
+                "There is an unmatched opening brace (depth never returned "
+                "to zero). Check recently edited comments and lines for a "
+                "lone { without a matching }.\n"
+            )
+
+        sys.exit(8)
+
     return result
 
 
@@ -746,7 +1023,7 @@ def main():
     args = parse_args()
 
     # Load all inputs
-    shell    = read_file(args.shell)
+    shell    = read_file(args.template)
     settings = load_settings(args.settings)
     setting_entries = collect_setting_names(settings)
 
@@ -776,16 +1053,33 @@ def main():
     statics = extract_rule_init_statics(common_path)
     cross_check(statics, setting_entries, args.strict)
 
+    # Resolve the version: either taken from --version, or read from the
+    # previous output and proposed as the bumped default to the user. The
+    # call exits the script on any validation failure.
+    version = prompt_or_resolve_version(args.version, args.output)
+
+    # Build date in ISO 8601 format with minute precision (no seconds).
+    # Local time is used so that operators reading the iApp config page see
+    # the time in the timezone they built it in. If you need UTC, switch to
+    # datetime.datetime.utcnow() and append " UTC" to the format string.
+    build_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    meta = {
+        "version":    version,
+        "build_date": build_date,
+    }
+
     # Generate the final tmpl
-    output = generate(shell, setting_entries, settings, rule_files)
+    output = generate(shell, setting_entries, settings, rule_files, meta)
 
     # Write the output file
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(output)
 
     sys.stderr.write(
-        f"Wrote {args.output} ({len(output)} bytes, "
-        f"{len(rule_files)} iRule(s), {len(setting_entries)} setting(s)).\n"
+        f"Wrote {args.output} ({len(output)} bytes, version {version}, "
+        f"built {build_date}, {len(rule_files)} iRule(s), "
+        f"{len(setting_entries)} setting(s)).\n"
     )
 
 

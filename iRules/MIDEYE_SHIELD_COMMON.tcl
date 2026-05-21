@@ -1006,12 +1006,12 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
             binary scan [sha512 "${SALT}${user}"] H* hashed_user
         }
 
-        set BODY    "{"
+        set BODY    "\{"
         append BODY "\"events\": \["
-        append BODY "{"
+        append BODY "\{"
         append BODY "\"ipAddress\":\"${client_ip}\""
         append BODY ",\"observedAt\": \"[clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]\""
-        append BODY ",\"authentication\": {"
+        append BODY ",\"authentication\": \{"
         append BODY "\"outcome\": \"$outcome\""
 
         if {$hashed_user != ""} {
@@ -1022,10 +1022,10 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
             append BODY ",\"method\": \"$method\""
         }
 
-        append BODY "}"
-        append BODY "}"
+        append BODY "\}"
+        append BODY "\}"
         append BODY "\]"
-        append BODY "}"
+        append BODY "\}"
 
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
