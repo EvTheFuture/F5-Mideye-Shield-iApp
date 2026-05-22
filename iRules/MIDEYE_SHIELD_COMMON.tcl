@@ -838,7 +838,7 @@ proc _VALIDATE { client_ip cache_time } {
     set client_ip [lindex [split $client_ip "%"] 0]
 
     # --- Blacklist check (highest priority) ---
-    if {[class match $client_ip equals MIDEYE_SHIELD_BLACKLIST]} {
+    if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_BLACKLIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
@@ -847,7 +847,7 @@ proc _VALIDATE { client_ip cache_time } {
     }
 
     # --- Whitelist check ---
-    if {[class match $client_ip equals MIDEYE_SHIELD_WHITELIST]} {
+    if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_WHITELIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_whitelisted"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 3 (Whitelisted)"
         return 1

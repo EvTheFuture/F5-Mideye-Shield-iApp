@@ -1,6 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
-# IAPP_VERSION: 0.10.13
-# IAPP_BUILD_DATE: 2026-05-22 16:36
+# IAPP_VERSION: 0.10.15
+# IAPP_BUILD_DATE: 2026-05-22 17:01
 
 cli admin-partitions {
     update-partition Common
@@ -33,65 +33,21 @@ sys application template /Common/MIDEYE_SHIELD {
 
 # =============================================================================
 # Mideye Shield iApp implementation
-#
-# This block runs every time the iApp is deployed or modified. It:
-#   1. Ensures the WHITELIST and BLACKLIST data groups exist (creating them
-#      with sensible defaults on first run, leaving them untouched on upgrade
-#      so that administrator edits are preserved).
-#   2. Generates a salt for username hashing if the administrator left the
-#      field blank.
-#   3. Builds the three Mideye Shield iRules by taking the iRule bodies that
-#      are embedded as TCL "set" assignments below, then substituting every
-#      __section__field__ placeholder with the corresponding $::section__field
-#      iApp variable, and finally creating or updating each iRule via tmsh.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # Data Groups
 #
-# DESIGN GOAL: the WHITELIST and BLACKLIST data groups must be
+# The WHITELIST and BLACKLIST data groups are
 #   (a) auto-created with sensible defaults on first deploy,
 #   (b) freely editable by the administrator afterwards (tmsh / GUI), and
 #   (c) NEVER modified or deleted by the iApp on reconfigure or upgrade.
 #
-# WHY EARLIER APPROACHES FAILED:
-# When an iApp creates an object with tmsh::create inside its implementation,
-# the object becomes part of the iApp's transaction and the framework OWNS it.
-# Ownership has two consequences that are wrong for admin-managed data groups:
-#   1. Strict-updates protection blocks direct edits (error 010715bc).
-#   2. Mark-and-sweep deletes any owned object not re-touched on a reconfigure
-#      run, which silently emptied/removed the data groups and then broke the
-#      iRule with: Unable to find value_list (MIDEYE_SHIELD_BLACKLIST).
-# Tagging the object app-service none inside the transaction was not reliable
-# across reconfigures, and an object owned by a previous template version is
-# still swept on the next reconfigure.
-#
-# THE FIX: create the data groups by piping a tmsh command into a SEPARATE
-# "tmsh -a" process (echo "create ..." | tmsh -a) via exec. That pipeline runs
-# OUTSIDE the iApp transaction, so the objects it creates are never tagged
-# with this app-service: they are not owned, strict-updates never protects
-# them (admin edits freely), and mark-and-sweep never tracks or deletes them.
-# This is the documented escape hatch for objects that must live independently
-# of the iApp. The iRule depends on these groups existing, so we create them
-# if absent and otherwise leave them entirely alone.
-#
-# PARTITION:
 # The groups are created in the partition the application service is deployed
 # into (e.g. /Common), NOT the iApp app-folder (/Common/MIDEYE_SHIELD.app),
 # so they are resolvable by the iRules and independent of the iApp folder. The
 # partition is derived from tmsh::pwd into the variable "partition" just below
 # and referenced as /$partition/<name>.
-#
-# IMPORTANT MIGRATION NOTE (one-time, manual):
-# A data group created by an OLDER version of this template is still owned by
-# the iApp and therefore still exposed to strict-updates and the sweep. This
-# template no longer touches existing groups, so it cannot detach them for
-# you. To migrate an already-owned group once, run from bash (not from the
-# iApp), with strict-updates temporarily disabled on the service (replace
-# /Common with the partition you deployed into):
-#   tmsh modify ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST app-service none
-#   tmsh modify ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST app-service none
-# After that the groups are detached and this template will leave them alone.
 # ---------------------------------------------------------------------------
 
 # Resolve the PARTITION the application service is being deployed into (e.g.
@@ -190,6 +146,24 @@ if { $::hash__username_salt eq "" } {
 # becomes  call /Common/MIDEYE_SHIELD.app/MIDEYE_SHIELD_COMMON::...
 set _partition [string trimleft [tmsh::pwd] "/"]
 
+# Resolve just the PARTITION the app service is deployed into
+# (e.g. Common), as opposed to __partition__ which is the full
+# app-folder path (e.g. Common/MIDEYE_SHIELD.app). This is needed
+# for objects that live in the partition root rather than the iApp
+# app-folder - in particular the data groups, which are created
+# out-of-band at /<partition>/MIDEYE_SHIELD_WHITELIST. iRule class
+# match statements must reference them with this partition-qualified
+# path (e.g. class match ... /__base_partition__/MIDEYE_SHIELD_...)
+# because a bare data-group name can fail to resolve from an iRule
+# running inside the app-folder.
+#
+# tmsh::pwd returns e.g. /Common/MIDEYE_SHIELD.app; splitting on
+# / gives {"" Common MIDEYE_SHIELD.app} so index 1 is the partition.
+set _base_partition [lindex [split [tmsh::pwd] "/"] 1]
+if { $_base_partition eq "" } {
+    set _base_partition "Common"
+}
+
 # Resolve the HSSR proc-library iRule path, depending on whether the
 # administrator chose to use an existing HSSR or have the iApp install
 # one. In install mode the bundled HSSR lives inside this iApp's
@@ -247,6 +221,7 @@ set _SUBST_MAP [list "__log__debug__" "$::log__debug" \
     "__infra__dns__" "$::infra__dns" \
     "__hash__username_salt__" "$::hash__username_salt" \
     "__partition__" "$_partition" \
+    "__base_partition__" "$_base_partition" \
     "__hssr_irule__" "$_hssr_irule" \
     "__hssr_helper_vs__" "$_hssr_helper_vs"]
 
@@ -262,7 +237,7 @@ set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
 # Version : 0.9.3
-# iApp Version : 0.10.13
+# iApp Version : 0.10.15
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-22
 #
@@ -350,7 +325,7 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
 # Version : 0.9.13
-# iApp Version : 0.10.13
+# iApp Version : 0.10.15
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-22
 #
@@ -1188,7 +1163,7 @@ proc _VALIDATE { client_ip cache_time } {
     set client_ip [lindex [split $client_ip "%"] 0]
 
     # --- Blacklist check (highest priority) ---
-    if {[class match $client_ip equals MIDEYE_SHIELD_BLACKLIST]} {
+    if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_BLACKLIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
@@ -1197,7 +1172,7 @@ proc _VALIDATE { client_ip cache_time } {
     }
 
     # --- Whitelist check ---
-    if {[class match $client_ip equals MIDEYE_SHIELD_WHITELIST]} {
+    if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_WHITELIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_whitelisted"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 3 (Whitelisted)"
         return 1
@@ -1527,7 +1502,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 0.10.13
+# iApp Version : 0.10.15
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -3085,8 +3060,8 @@ if { $::hssr__mode eq "install" } {
             presentation {
 
 section about {
-    message version
-    message build_date
+    message version "Version: 0.10.15"
+    message build_date "Build date: 2026-05-22 17:01"
 }
 section log {
     choice debug display "small" default "0" {
@@ -3163,8 +3138,8 @@ section hash {
 
 text {
     about                     "About"
-    about.version             "Version: 0.10.13"
-    about.build_date          "Build date: 2026-05-22 16:36"
+    about.version             ""
+    about.build_date          ""
     log                       "Debug"
     log.debug                 "Enable Debug Logging"
     api                       "API Settings"

@@ -114,6 +114,29 @@ INTERNAL_SUBSTITUTIONS = [
         ],
     },
     {
+        "placeholder": "__base_partition__",
+        "tcl_var": "_base_partition",
+        "setup_code": [
+            "# Resolve just the PARTITION the app service is deployed into",
+            "# (e.g. Common), as opposed to __partition__ which is the full",
+            "# app-folder path (e.g. Common/MIDEYE_SHIELD.app). This is needed",
+            "# for objects that live in the partition root rather than the iApp",
+            "# app-folder - in particular the data groups, which are created",
+            "# out-of-band at /<partition>/MIDEYE_SHIELD_WHITELIST. iRule class",
+            "# match statements must reference them with this partition-qualified",
+            "# path (e.g. class match ... /__base_partition__/MIDEYE_SHIELD_...)",
+            "# because a bare data-group name can fail to resolve from an iRule",
+            "# running inside the app-folder.",
+            "#",
+            "# tmsh::pwd returns e.g. /Common/MIDEYE_SHIELD.app; splitting on",
+            "# / gives {\"\" Common MIDEYE_SHIELD.app} so index 1 is the partition.",
+            "set _base_partition [lindex [split [tmsh::pwd] \"/\"] 1]",
+            "if { $_base_partition eq \"\" } {",
+            "    set _base_partition \"Common\"",
+            "}",
+        ],
+    },
+    {
         "placeholder": "__hssr_irule__",
         "tcl_var": "_hssr_irule",
         "setup_code": [
@@ -630,9 +653,18 @@ def build_presentation(setting_entries, settings, meta):
     lines = []
 
     # ----- Auto-generated "about" section (version, build date) -----
+    # The version and build date are emitted as INLINE message text
+    # (message <name> "<text>"), which renders as a read-only line of text.
+    # Declaring the message with no inline text and supplying the value only
+    # via the text{} table instead makes TMUI render an editable-looking
+    # value cell (an empty box next to the label), which is not what we want
+    # for a static informational line.
+    version_msg = ("Version: " + meta["version"]).replace('"', '\\"')
+    build_msg   = ("Build date: " + meta["build_date"]).replace('"', '\\"')
+
     lines.append("section about {")
-    lines.append("    message version")
-    lines.append("    message build_date")
+    lines.append(f'    message version "{version_msg}"')
+    lines.append(f'    message build_date "{build_msg}"')
     lines.append("}")
 
     # ----- User-defined sections from iapp-settings.json -----
@@ -835,15 +867,14 @@ def build_text_block(setting_entries, settings, meta):
     width = max(len(p) for p in paths) + 4
 
     # ----- Auto-generated "about" section text -----
-    # The labels here are what the iApp UI actually displays to the admin.
-    # Escape any double quotes in the version or build_date defensively
-    # even though the validators upstream should prevent them.
-    version_value = meta["version"].replace('"', '\\"')
-    build_value   = meta["build_date"].replace('"', '\\"')
-
+    # The version and build date strings themselves are now the INLINE text of
+    # the message elements (see build_presentation), which renders read-only.
+    # Here we only provide the section label ("About") and EMPTY labels for the
+    # two messages so the UI shows just the informational text with no extra
+    # label cell that would look like an editable field.
     lines.append(f'    {"about".ljust(width)}"About"')
-    lines.append(f'    {"about.version".ljust(width)}"Version: {version_value}"')
-    lines.append(f'    {"about.build_date".ljust(width)}"Build date: {build_value}"')
+    lines.append(f'    {"about.version".ljust(width)}""')
+    lines.append(f'    {"about.build_date".ljust(width)}""')
 
     # ----- User-defined section labels -----
     # Emit one line per section, then per field
