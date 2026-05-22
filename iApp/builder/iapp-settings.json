@@ -176,6 +176,15 @@
                     "required": true,
                     "display": "medium",
                     "default": "10"
+                },
+                {
+                    "name": "score_deny_cache_time",
+                    "field": "deny_cache_time",
+                    "label": "Deny Score Cache Time (seconds, for blocked IPs)",
+                    "type": "string",
+                    "required": true,
+                    "display": "medium",
+                    "default": "86400"
                 }
             ]
         },

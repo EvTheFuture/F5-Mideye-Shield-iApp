@@ -199,6 +199,7 @@ when RULE_INIT {
     set static::MIDEYE_SHIELD_score_warn             "__score__warn__"
     set static::MIDEYE_SHIELD_score_cache_time       "__score__cache_time__"
     set static::MIDEYE_SHIELD_login_score_cache_time "__score__login_cache_time__"
+    set static::MIDEYE_SHIELD_score_deny_cache_time  "__score__deny_cache_time__"
 
     # Pending queue and polling
     set static::MIDEYE_SHIELD_pending_max            "__pending__max__"
@@ -642,11 +643,18 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
 
     # Check if we have a cached value
     if {$CACHED != "" && $CACHED >= 0} {
-        call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_cache_hits"
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Using Cached Risk Score of '$CACHED' for '$client_ip'"
+        set CACHED_VALUE_LIFETIME [table lookup -subtable "MIDEYE_SHIELD" $SCORE_KEY]
 
-        call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
-        return $CACHED
+        if {$CACHED_VALUE_LIFETIME != -1 && $CACHED_VALUE_LIFETIME <= $cache_time} {
+            call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_cache_hits"
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Using Cached Risk Score of '$CACHED' for '$client_ip'"
+
+            call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
+            return $CACHED
+        } else {
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Cached Risk Score for '$client_ip' has been cached for too long for this validation, deleting..."
+            call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
+        }
     }
 
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_cache_misses"
@@ -731,9 +739,23 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "SCORE: SCORE: '$SCORE' for '$SAFE_IP'"
 
+        # Decide the cache TTL for this resolved score. A score that will be
+        # hard-denied does not need to be re-checked against the API every few
+        # seconds, so it is cached for much longer (deny_cache_time, default
+        # 24h). Any score below the hard-deny threshold keeps the caller's
+        # normal TTL (the connection or login cache time).
+        set HARD_DENY_THRESHOLD $static::MIDEYE_SHIELD_score_hard_deny
+        set DENY_CACHE_TIME     $static::MIDEYE_SHIELD_score_deny_cache_time
+
+        set EFFECTIVE_CACHE_TIME $cache_time
+
+        if { $SCORE >= $HARD_DENY_THRESHOLD } {
+            set EFFECTIVE_CACHE_TIME $DENY_CACHE_TIME
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Caching denied IP '$SAFE_IP' score '$SCORE' for extended TTL '$EFFECTIVE_CACHE_TIME's"
+        }
+
         # Write the resolved score to cache and release the pending key.
-        # Use the cache_time supplied by the caller (connection vs login TTL).
-        call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_SET $SCORE_KEY $SCORE $cache_time $cache_time
+        call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_SET $SCORE_KEY $SCORE $EFFECTIVE_CACHE_TIME $EFFECTIVE_CACHE_TIME
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
 
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_api_success"

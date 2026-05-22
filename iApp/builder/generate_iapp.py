@@ -653,14 +653,13 @@ def build_presentation(setting_entries, settings, meta):
     lines = []
 
     # ----- Auto-generated "about" section (version, build date) -----
-    # The version and build date are emitted as INLINE message text
-    # (message <name> "<text>"), which renders as a read-only line of text.
-    # Declaring the message with no inline text and supplying the value only
-    # via the text{} table instead makes TMUI render an editable-looking
-    # value cell (an empty box next to the label), which is not what we want
-    # for a static informational line.
-    version_msg = ("Version: " + meta["version"]).replace('"', '\\"')
-    build_msg   = ("Build date: " + meta["build_date"]).replace('"', '\\"')
+    # The message VALUE (right column) is the inline message text; the LABEL
+    # (left column) is supplied via the text{} block below. Splitting them
+    # this way puts "Version:" / "Build date:" in the left label column and
+    # the actual values in the right column, instead of both landing together
+    # in the right column.
+    version_msg = meta["version"].replace('"', '\\"')
+    build_msg   = meta["build_date"].replace('"', '\\"')
 
     lines.append("section about {")
     lines.append(f'    message version "{version_msg}"')
@@ -867,14 +866,11 @@ def build_text_block(setting_entries, settings, meta):
     width = max(len(p) for p in paths) + 4
 
     # ----- Auto-generated "about" section text -----
-    # The version and build date strings themselves are now the INLINE text of
-    # the message elements (see build_presentation), which renders read-only.
-    # Here we only provide the section label ("About") and EMPTY labels for the
-    # two messages so the UI shows just the informational text with no extra
-    # label cell that would look like an editable field.
+    # These are the LEFT-column labels. The actual values are the inline
+    # message text in build_presentation (right column).
     lines.append(f'    {"about".ljust(width)}"About"')
-    lines.append(f'    {"about.version".ljust(width)}""')
-    lines.append(f'    {"about.build_date".ljust(width)}""')
+    lines.append(f'    {"about.version".ljust(width)}"Version:"')
+    lines.append(f'    {"about.build_date".ljust(width)}"Build date:"')
 
     # ----- User-defined section labels -----
     # Emit one line per section, then per field
