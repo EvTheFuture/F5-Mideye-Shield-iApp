@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
-# Version : 0.9.2
+# Version : 0.9.3
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-18
+# Date    : 2026-05-22
 #
 # Purpose
 # -------
@@ -22,14 +22,18 @@
 #
 # Description
 # -----------
-# ACCESS_POLICY_EVENT handles a custom "validate_ip" event triggered from
-# within the access profile using an iRule Event agent. The event name is
-# case-sensitive and must match exactly what is configured in the policy.
+# ACCESS_POLICY_AGENT_EVENT handles the event id "MIDEYE_SHIELD-VALIDATE_IP"
+# triggered from within the access profile using an iRule Event agent. The event
+# id is case-sensitive and the policy must match exactly this name to function.
 #
 # If VALIDATE_LOGIN returns 0 (deny), the session variable
 # "session.custom.shield.allow" is set to 0 and the policy can branch on
 # this value using a Variable Assign or Empty Ending agent. If 1 (allow),
 # the variable is set to 1.
+#
+# Use the following branch rule to match if the IP is allowed:
+# expr {[mcget session.custom.shield.allow] == 1}
+#
 #
 # ACCESS_POLICY_COMPLETED fires after the policy has reached an ending and
 # the final allow/deny decision is known. The auth result is reported to
@@ -39,12 +43,10 @@
 # Access Policy Configuration
 # ---------------------------
 # In the access profile, add an iRule Event agent and set the ID to:
-#   validate_ip
+# MIDEYE_SHIELD-VALIDATE_IP
 #
-# After the event agent, add a Variable Assign or branch on:
-#   session.custom.shield.allow
-#   Value 0 = deny branch
-#   Value 1 = allow branch
+# Use the following branch rule to match if the IP is allowed:
+# expr {[mcget session.custom.shield.allow] == 1}
 #
 #
 # Dependencies - iRules (call targets)

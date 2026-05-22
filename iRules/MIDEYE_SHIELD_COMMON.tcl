@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.11
+# Version : 0.9.12
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-18
+# Date    : 2026-05-22
 #
 # Purpose
 # -------
@@ -43,8 +43,56 @@
 # This gives a single atomic test-and-set with no read-modify-write gap.
 #
 #
+# Session Variables
+# -----------------
+# session.custom.shield.method  - Store ONE of the following values during authentication
+#                                 -------------------------------------------------------
+#                                 client_certificate
+#                                 password_only
+#                                 password_totp
+#
+# session.custom.shield.reason  - Store ONE of the following authentication results
+#                                 -------------------------------------------------
+#                                 success
+#                                 failed_second_factor
+#                                 invalid_password
+#                                 user_not_found
+#
+# iRule Events
+# ------------
+# MIDEYE_SHIELD-VALIDATE_IP     - Call this to validate the connecting client's IP address
+#                                 Use the following branch rule to branch if the IP is Allowed
+#                                 "expr {[mcget session.custom.shield.allow] == 1}"
+#
 # Procedures exposed
 # ------------------
+#   /__partition__/MIDEYE_SHIELD_COMMON::LOG_ALERT
+#       Log to syslog with severity Alert
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG
+#       Log to syslog with severity Debug (if debug is enabled in iApp settings)
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::LOG_ERROR
+#       Log to syslog with severity Error
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO
+#       Log to syslog with severity Info
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING
+#       Log to syslog with severity Warn
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::GET_STATS
+#       Returns a flat {key value key value ...} list of all counters.
+#       Iterate with: foreach {K V} [call /__partition__/MIDEYE_SHIELD_COMMON::GET_STATS] {}
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT  client_ip  auth_result
+#       Fire-and-forget report of an auth outcome back to the Shield API.
+#       Called from the APM iRule after ACCESS_POLICY_COMPLETED.
+#       auth_result must be either "allow" or "deny".
+#
+#   /__partition__/MIDEYE_SHIELD_COMMON::RESET_STATS
+#       Resets all statistics counters to zero.
+#
 #   /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_CONNECTION  client_ip
 #       Validates an IP at the TCP connection level using score_cache_time.
 #       Returns 1 to allow, 0 to reject.
@@ -57,18 +105,6 @@
 #       Otherwise identical behaviour to VALIDATE_CONNECTION.
 #       Use this when a shorter cache time is appropriate, e.g. before
 #       authenticating a user where a fresher score is desirable.
-#
-#   /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT  client_ip  auth_result
-#       Fire-and-forget report of an auth outcome back to the Shield API.
-#       Called from the APM iRule after ACCESS_POLICY_COMPLETED.
-#       auth_result must be either "allow" or "deny".
-#
-#   /__partition__/MIDEYE_SHIELD_COMMON::GET_STATS
-#       Returns a flat {key value key value ...} list of all counters.
-#       Iterate with: foreach {K V} [call /__partition__/MIDEYE_SHIELD_COMMON::GET_STATS] {}
-#
-#   /__partition__/MIDEYE_SHIELD_COMMON::RESET_STATS
-#       Resets all statistics counters to zero.
 #
 #
 # Dependencies - Data Groups
@@ -1109,11 +1145,14 @@ proc RESET_STATS {} {
     }
 }
 
+# These two events are needed so we can use "after" while waiting
+# for another task to complete fetching of a score to the local cache
 when CLIENT_ACCEPTED {
     set MIDEYE_SHIELD_WAITING 0
 }
 
 when CLIENT_DATA {
+    # If we are waiting, we need to keep collecting data until it has finished
     if {$MIDEYE_SHIELD_WAITING == 1} {
         TCP::collect
         return
