@@ -1,6 +1,6 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.12
+# Version : 0.9.13
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-22
 #
@@ -230,15 +230,26 @@ when RULE_INIT {
 proc _LOG_COMMON {level msg {noname false}} {
     set chunk_size 750
 
-    set prefix ""
+    if {$noname} {
+        set prefix "MIDEYE_SHIELD: "
+    } else {
+        set prefix ""
+    }
+
+    set id ""
 
     catch {
-        set prefix "[ACCESS::session data get session.user.display_sessionid]: "
+        set sid [ACCESS::session data get session.user.display_sessionid]
+        if {$sid != ""} {
+            set id "${sid}: "
+        }
     }
 
-    if {$prefix == ""} {
-        catch { set prefix "[IP::client_addr]:[TCP::client_port] - " } ERR
+    if {$id == ""} {
+        catch { set id "<[IP::client_addr]:[TCP::client_port]>: " } ERR
     }
+
+    append prefix $id
 
     # Get the total length of the input string
     set len [string length $msg]

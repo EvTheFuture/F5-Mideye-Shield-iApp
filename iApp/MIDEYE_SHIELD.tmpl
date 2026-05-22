@@ -1,6 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
-# IAPP_VERSION: 0.10.9
-# IAPP_BUILD_DATE: 2026-05-22 15:04
+# IAPP_VERSION: 0.10.13
+# IAPP_BUILD_DATE: 2026-05-22 16:36
 
 cli admin-partitions {
     update-partition Common
@@ -49,78 +49,89 @@ sys application template /Common/MIDEYE_SHIELD {
 # ---------------------------------------------------------------------------
 # Data Groups
 #
-# MARK-AND-SWEEP SAFETY (this is the important part):
-# On reconfigure, the iApp framework re-runs this implementation and then
-# deletes (sweeps) any iApp-owned object that was NOT touched (i.e. not
-# created/modified) during the run. F5 docs state that untouched objects are
-# deleted in the sweep, and that create commands are automatically changed to
-# modify on re-entry.
+# DESIGN GOAL: the WHITELIST and BLACKLIST data groups must be
+#   (a) auto-created with sensible defaults on first deploy,
+#   (b) freely editable by the administrator afterwards (tmsh / GUI), and
+#   (c) NEVER modified or deleted by the iApp on reconfigure or upgrade.
 #
-# An earlier version guarded BOTH the create and the records with a single
-# "if missing" check. That meant on reconfigure the create was skipped, the
-# data group became untouched, and mark-and-sweep DELETED it - which then
-# broke the iRule with "Unable to find value_list (MIDEYE_SHIELD_BLACKLIST)".
+# WHY EARLIER APPROACHES FAILED:
+# When an iApp creates an object with tmsh::create inside its implementation,
+# the object becomes part of the iApp's transaction and the framework OWNS it.
+# Ownership has two consequences that are wrong for admin-managed data groups:
+#   1. Strict-updates protection blocks direct edits (error 010715bc).
+#   2. Mark-and-sweep deletes any owned object not re-touched on a reconfigure
+#      run, which silently emptied/removed the data groups and then broke the
+#      iRule with: Unable to find value_list (MIDEYE_SHIELD_BLACKLIST).
+# Tagging the object app-service none inside the transaction was not reliable
+# across reconfigures, and an object owned by a previous template version is
+# still swept on the next reconfigure.
 #
-# The fix: ALWAYS issue a create for each data group every run (so it is
-# always touched and never swept), but only include the seed RECORDS on the
-# very first deployment. On reconfigure the create is converted to a modify
-# with no records clause, which touches the object while leaving its existing
-# records - including any administrator edits - completely intact.
+# THE FIX: create the data groups by piping a tmsh command into a SEPARATE
+# "tmsh -a" process (echo "create ..." | tmsh -a) via exec. That pipeline runs
+# OUTSIDE the iApp transaction, so the objects it creates are never tagged
+# with this app-service: they are not owned, strict-updates never protects
+# them (admin edits freely), and mark-and-sweep never tracks or deletes them.
+# This is the documented escape hatch for objects that must live independently
+# of the iApp. The iRule depends on these groups existing, so we create them
+# if absent and otherwise leave them entirely alone.
 #
-# BRACE HANDLING:
-# Each create is passed to tmsh::create as a SINGLE brace-grouped argument:
-#   tmsh::create { ltm data-group internal ... records add { ... } }
-# Wrapping the whole command in braces hands tmsh the literal text with all
-# inner braces preserved, so tmsh parses it with its own CLI-style parser
-# instead of letting the TCL argument lexer strip the record braces (which
-# produced the old "records: required brace is missing" error). These
-# commands contain no runtime variables, so a pure brace literal is correct
-# here. Backslash-escaped braces are only needed when variables must be
-# interpolated into the command, as in the HSSR virtual server command.
+# PARTITION:
+# The groups are created in the partition the application service is deployed
+# into (e.g. /Common), NOT the iApp app-folder (/Common/MIDEYE_SHIELD.app),
+# so they are resolvable by the iRules and independent of the iApp folder. The
+# partition is derived from tmsh::pwd into the variable "partition" just below
+# and referenced as /$partition/<name>.
+#
+# IMPORTANT MIGRATION NOTE (one-time, manual):
+# A data group created by an OLDER version of this template is still owned by
+# the iApp and therefore still exposed to strict-updates and the sweep. This
+# template no longer touches existing groups, so it cannot detach them for
+# you. To migrate an already-owned group once, run from bash (not from the
+# iApp), with strict-updates temporarily disabled on the service (replace
+# /Common with the partition you deployed into):
+#   tmsh modify ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST app-service none
+#   tmsh modify ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST app-service none
+# After that the groups are detached and this template will leave them alone.
 # ---------------------------------------------------------------------------
 
-# Helper: return 1 if the given config object is missing, 0 if it exists.
-# Handles both get_config failure modes (error thrown OR empty result).
-# Note: NO leading slash before "ltm" in the module path (the leading slash
-# belongs only on the /Common/<name> object path).
+# Resolve the PARTITION the application service is being deployed into (e.g.
+# Common), NOT the iApp app-folder (MIDEYE_SHIELD.app). tmsh::pwd returns the
+# app-folder path like /Common/MIDEYE_SHIELD.app; splitting on "/" gives
+# {"" "Common" "MIDEYE_SHIELD.app"} so index 1 is the partition name. Fall
+# back to Common if anything is unexpected.
+set partition [lindex [split [tmsh::pwd] "/"] 1]
+
+if { $partition eq "" } {
+    set partition "Common"
+}
+
+# Helper: return 1 if the given internal data group is missing, else 0.
+# Runs via exec tmsh (outside the iApp transaction) and treats any error or
+# empty output as missing.
 proc _MIDEYE_SHIELD_dg_missing { dg_path } {
-    if { [catch { set _cfg [tmsh::get_config ltm data-group internal $dg_path] }] } {
-        # get_config threw - object does not exist.
+    if { [catch { set _out [exec tmsh list ltm data-group internal $dg_path] } _err] } {
+        # tmsh exited non-zero (object not found) - treat as missing.
         return 1
     }
 
-    if { [string trim $_cfg] eq "" } {
-        # get_config returned nothing - object does not exist.
+    if { [string trim $_out] eq "" } {
+        # No output - treat as missing.
         return 1
     }
 
     return 0
 }
 
-# Capture each group's pre-run existence BEFORE we touch anything, so we know
-# whether to seed default records (first deploy) or just touch the object
-# (reconfigure).
-set _MIDEYE_SHIELD_wl_missing [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_WHITELIST]
-set _MIDEYE_SHIELD_bl_missing [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_BLACKLIST]
-
-# WHITELIST: always create (touch), seed RFC1918 defaults only on first deploy.
-if { $_MIDEYE_SHIELD_wl_missing } {
-    # First-time deployment - create with the default RFC1918 seed records.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip records add { 10.0.0.0/8 { } 172.16.0.0/20 { } 192.168.0.0/16 { } } }
-} else {
-    # Reconfigure - touch the object (create becomes modify, no records
-    # clause) so mark-and-sweep does not delete it, preserving admin edits.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip }
+# WHITELIST: create with RFC1918 defaults ONLY if absent. Created by piping
+# the command into a separate tmsh -a process, so the group is unowned and
+# admin-editable and never swept. Existing groups are left alone.
+if { [_MIDEYE_SHIELD_dg_missing /$partition/MIDEYE_SHIELD_WHITELIST] } {
+    exec tmsh -a create ltm data-group internal /$partition/MIDEYE_SHIELD_WHITELIST type ip records add \{ 10.0.0.0/8 \{ \} 172.16.0.0/20 \{ \} 192.168.0.0/16 \{ \} \}
 }
 
-# BLACKLIST: always create (touch). Starts empty; never seed records.
-if { $_MIDEYE_SHIELD_bl_missing } {
-    # First-time deployment - create empty blacklist.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
-} else {
-    # Reconfigure - touch the object so mark-and-sweep does not delete it,
-    # preserving any blacklist entries the administrator has added.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
+# BLACKLIST: create empty ONLY if absent, same out-of-transaction method.
+if { [_MIDEYE_SHIELD_dg_missing /$partition/MIDEYE_SHIELD_BLACKLIST] } {
+    exec tmsh -a create ltm data-group internal /$partition/MIDEYE_SHIELD_BLACKLIST type ip
 }
 
 # ---------------------------------------------------------------------------
@@ -251,7 +262,7 @@ set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
 # Version : 0.9.3
-# iApp Version : 0.10.9
+# iApp Version : 0.10.13
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-22
 #
@@ -338,8 +349,8 @@ when ACCESS_POLICY_COMPLETED {
 set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.12
-# iApp Version : 0.10.9
+# Version : 0.9.13
+# iApp Version : 0.10.13
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-22
 #
@@ -569,15 +580,26 @@ when RULE_INIT {
 proc _LOG_COMMON {level msg {noname false}} {
     set chunk_size 750
 
-    set prefix ""
+    if {$noname} {
+        set prefix "MIDEYE_SHIELD: "
+    } else {
+        set prefix ""
+    }
+
+    set id ""
 
     catch {
-        set prefix "[ACCESS::session data get session.user.display_sessionid]: "
+        set sid [ACCESS::session data get session.user.display_sessionid]
+        if {$sid != ""} {
+            set id "${sid}: "
+        }
     }
 
-    if {$prefix == ""} {
-        catch { set prefix "[IP::client_addr]:[TCP::client_port] - " } ERR
+    if {$id == ""} {
+        catch { set id "<[IP::client_addr]:[TCP::client_port]>: " } ERR
     }
+
+    append prefix $id
 
     # Get the total length of the input string
     set len [string length $msg]
@@ -1505,7 +1527,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 0.10.9
+# iApp Version : 0.10.13
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -3141,8 +3163,8 @@ section hash {
 
 text {
     about                     "About"
-    about.version             "Version: 0.10.9"
-    about.build_date          "Build date: 2026-05-22 15:04"
+    about.version             "Version: 0.10.13"
+    about.build_date          "Build date: 2026-05-22 16:36"
     log                       "Debug"
     log.debug                 "Enable Debug Logging"
     api                       "API Settings"

@@ -31,94 +31,61 @@ sys application template /Common/MIDEYE_SHIELD {
 
 # =============================================================================
 # Mideye Shield iApp implementation
-#
-# This block runs every time the iApp is deployed or modified. It:
-#   1. Ensures the WHITELIST and BLACKLIST data groups exist (creating them
-#      with sensible defaults on first run, leaving them untouched on upgrade
-#      so that administrator edits are preserved).
-#   2. Generates a salt for username hashing if the administrator left the
-#      field blank.
-#   3. Builds the three Mideye Shield iRules by taking the iRule bodies that
-#      are embedded as TCL "set" assignments below, then substituting every
-#      __section__field__ placeholder with the corresponding $::section__field
-#      iApp variable, and finally creating or updating each iRule via tmsh.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # Data Groups
 #
-# MARK-AND-SWEEP SAFETY (this is the important part):
-# On reconfigure, the iApp framework re-runs this implementation and then
-# deletes (sweeps) any iApp-owned object that was NOT touched (i.e. not
-# created/modified) during the run. F5 docs state that untouched objects are
-# deleted in the sweep, and that create commands are automatically changed to
-# modify on re-entry.
+# The WHITELIST and BLACKLIST data groups are
+#   (a) auto-created with sensible defaults on first deploy,
+#   (b) freely editable by the administrator afterwards (tmsh / GUI), and
+#   (c) NEVER modified or deleted by the iApp on reconfigure or upgrade.
 #
-# An earlier version guarded BOTH the create and the records with a single
-# "if missing" check. That meant on reconfigure the create was skipped, the
-# data group became untouched, and mark-and-sweep DELETED it - which then
-# broke the iRule with "Unable to find value_list (MIDEYE_SHIELD_BLACKLIST)".
-#
-# The fix: ALWAYS issue a create for each data group every run (so it is
-# always touched and never swept), but only include the seed RECORDS on the
-# very first deployment. On reconfigure the create is converted to a modify
-# with no records clause, which touches the object while leaving its existing
-# records - including any administrator edits - completely intact.
-#
-# BRACE HANDLING:
-# Each create is passed to tmsh::create as a SINGLE brace-grouped argument:
-#   tmsh::create { ltm data-group internal ... records add { ... } }
-# Wrapping the whole command in braces hands tmsh the literal text with all
-# inner braces preserved, so tmsh parses it with its own CLI-style parser
-# instead of letting the TCL argument lexer strip the record braces (which
-# produced the old "records: required brace is missing" error). These
-# commands contain no runtime variables, so a pure brace literal is correct
-# here. Backslash-escaped braces are only needed when variables must be
-# interpolated into the command, as in the HSSR virtual server command.
+# The groups are created in the partition the application service is deployed
+# into (e.g. /Common), NOT the iApp app-folder (/Common/MIDEYE_SHIELD.app),
+# so they are resolvable by the iRules and independent of the iApp folder. The
+# partition is derived from tmsh::pwd into the variable "partition" just below
+# and referenced as /$partition/<name>.
 # ---------------------------------------------------------------------------
 
-# Helper: return 1 if the given config object is missing, 0 if it exists.
-# Handles both get_config failure modes (error thrown OR empty result).
-# Note: NO leading slash before "ltm" in the module path (the leading slash
-# belongs only on the /Common/<name> object path).
+# Resolve the PARTITION the application service is being deployed into (e.g.
+# Common), NOT the iApp app-folder (MIDEYE_SHIELD.app). tmsh::pwd returns the
+# app-folder path like /Common/MIDEYE_SHIELD.app; splitting on "/" gives
+# {"" "Common" "MIDEYE_SHIELD.app"} so index 1 is the partition name. Fall
+# back to Common if anything is unexpected.
+set partition [lindex [split [tmsh::pwd] "/"] 1]
+
+if { $partition eq "" } {
+    set partition "Common"
+}
+
+# Helper: return 1 if the given internal data group is missing, else 0.
+# Runs via exec tmsh (outside the iApp transaction) and treats any error or
+# empty output as missing.
 proc _MIDEYE_SHIELD_dg_missing { dg_path } {
-    if { [catch { set _cfg [tmsh::get_config ltm data-group internal $dg_path] }] } {
-        # get_config threw - object does not exist.
+    if { [catch { set _out [exec tmsh list ltm data-group internal $dg_path] } _err] } {
+        # tmsh exited non-zero (object not found) - treat as missing.
         return 1
     }
 
-    if { [string trim $_cfg] eq "" } {
-        # get_config returned nothing - object does not exist.
+    if { [string trim $_out] eq "" } {
+        # No output - treat as missing.
         return 1
     }
 
     return 0
 }
 
-# Capture each group's pre-run existence BEFORE we touch anything, so we know
-# whether to seed default records (first deploy) or just touch the object
-# (reconfigure).
-set _MIDEYE_SHIELD_wl_missing [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_WHITELIST]
-set _MIDEYE_SHIELD_bl_missing [_MIDEYE_SHIELD_dg_missing /Common/MIDEYE_SHIELD_BLACKLIST]
-
-# WHITELIST: always create (touch), seed RFC1918 defaults only on first deploy.
-if { $_MIDEYE_SHIELD_wl_missing } {
-    # First-time deployment - create with the default RFC1918 seed records.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip records add { 10.0.0.0/8 { } 172.16.0.0/20 { } 192.168.0.0/16 { } } }
-} else {
-    # Reconfigure - touch the object (create becomes modify, no records
-    # clause) so mark-and-sweep does not delete it, preserving admin edits.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_WHITELIST type ip }
+# WHITELIST: create with RFC1918 defaults ONLY if absent. Created by piping
+# the command into a separate tmsh -a process, so the group is unowned and
+# admin-editable and never swept. Existing groups are left alone.
+if { [_MIDEYE_SHIELD_dg_missing /$partition/MIDEYE_SHIELD_WHITELIST] } {
+    exec tmsh -a create ltm data-group internal /$partition/MIDEYE_SHIELD_WHITELIST type ip records add \{ 10.0.0.0/8 \{ \} 172.16.0.0/20 \{ \} 192.168.0.0/16 \{ \} \}
 }
 
-# BLACKLIST: always create (touch). Starts empty; never seed records.
-if { $_MIDEYE_SHIELD_bl_missing } {
-    # First-time deployment - create empty blacklist.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
-} else {
-    # Reconfigure - touch the object so mark-and-sweep does not delete it,
-    # preserving any blacklist entries the administrator has added.
-    tmsh::create { ltm data-group internal /Common/MIDEYE_SHIELD_BLACKLIST type ip }
+# BLACKLIST: create empty ONLY if absent, same out-of-transaction method.
+if { [_MIDEYE_SHIELD_dg_missing /$partition/MIDEYE_SHIELD_BLACKLIST] } {
+    exec tmsh -a create ltm data-group internal /$partition/MIDEYE_SHIELD_BLACKLIST type ip
 }
 
 # ---------------------------------------------------------------------------
