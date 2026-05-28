@@ -1,6 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
-# IAPP_VERSION: 0.10.17
-# IAPP_BUILD_DATE: 2026-05-22 17:35
+# IAPP_VERSION: 1.0.0
+# IAPP_BUILD_DATE: 2026-05-28 15:00
 
 cli admin-partitions {
     update-partition Common
@@ -238,7 +238,7 @@ set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
 # Version : 0.9.3
-# iApp Version : 0.10.17
+# iApp Version : 1.0.0
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-22
 #
@@ -325,10 +325,10 @@ when ACCESS_POLICY_COMPLETED {
 set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.13
-# iApp Version : 0.10.17
+# Version : 0.9.14
+# iApp Version : 1.0.0
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-22
+# Date    : 2026-05-28
 #
 # Purpose
 # -------
@@ -376,6 +376,7 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 #                                 client_certificate
 #                                 password_only
 #                                 password_totp
+#                                 passwordless_eid
 #
 # session.custom.shield.reason  - Store ONE of the following authentication results
 #                                 -------------------------------------------------
@@ -1422,6 +1423,8 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
         append BODY "\]"
         append BODY "\}"
 
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', username: '$user'"
+
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
         lappend ARGS \
@@ -1525,7 +1528,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 0.10.17
+# iApp Version : 1.0.0
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -3083,8 +3086,8 @@ if { $::hssr__mode eq "install" } {
             presentation {
 
 section about {
-    message version "0.10.17"
-    message build_date "2026-05-22 17:35"
+    message version "1.0.0"
+    message build_date "2026-05-28 15:00"
 }
 section log {
     choice debug display "small" default "0" {
