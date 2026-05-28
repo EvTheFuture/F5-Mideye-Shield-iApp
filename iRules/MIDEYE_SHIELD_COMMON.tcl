@@ -1,6 +1,6 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.14
+# Version : 0.9.15
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-28
 #
@@ -1062,6 +1062,10 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
 
         if {$reason == "success" || $auth_result == "allow"} {
             set outcome "success"
+        } elseif {$reason == ""} {
+            # If the reason was not set, we just skip reporting
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Reason was not set, will skip reporting, ipAddress: '$client_ip', username: '$user'"
+            return
         } elseif {$reason == "user_not_found" && $user == ""} {
             # If the user was not found and there where no user name defined,
             # the logon page has most likely just been reloaded and we just ignore it
