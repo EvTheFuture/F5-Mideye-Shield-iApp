@@ -45,25 +45,29 @@
 #
 # Session Variables
 # -----------------
-# session.custom.shield.method  - Store ONE of the following values during authentication
-#                                 -------------------------------------------------------
-#                                 client_certificate
-#                                 password_only
-#                                 password_totp
-#                                 passwordless_eid
+# session.custom.shield.has_reported  - Set to 1 if reported authentication status to Shield
 #
-# session.custom.shield.reason  - Store ONE of the following authentication results
-#                                 -------------------------------------------------
-#                                 success
-#                                 failed_second_factor
-#                                 invalid_password
-#                                 user_not_found
+# session.custom.shield.method        - Store ONE of the following values during authentication
+#                                       -------------------------------------------------------
+#                                       client_certificate
+#                                       password_only
+#                                       password_totp
+#                                       passwordless_eid
+#
+# session.custom.shield.reason        - Store ONE of the following authentication results
+#                                       -------------------------------------------------
+#                                       success
+#                                       failed_second_factor
+#                                       invalid_password
+#                                       user_not_found
 #
 # iRule Events
 # ------------
-# MIDEYE_SHIELD-VALIDATE_IP     - Call this to validate the connecting client's IP address
-#                                 Use the following branch rule to branch if the IP is Allowed
-#                                 "expr {[mcget session.custom.shield.allow] == 1}"
+# MIDEYE_SHIELD-VALIDATE_IP         - Call this to validate the connecting client's IP address
+#                                     Use the following branch rule to branch if the IP is Allowed
+#                                     "expr {[mcget session.custom.shield.allow] == 1}"
+#
+# MIDEYE_SHIELD-REPORT_AUTH_RESULT  - Call this to report the authentication outcome outcome
 #
 # Procedures exposed
 # ------------------
@@ -86,10 +90,9 @@
 #       Returns a flat {key value key value ...} list of all counters.
 #       Iterate with: foreach {K V} [call /__partition__/MIDEYE_SHIELD_COMMON::GET_STATS] {}
 #
-#   /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT  client_ip  auth_result
+#   /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT  client_ip
 #       Fire-and-forget report of an auth outcome back to the Shield API.
-#       Called from the APM iRule after ACCESS_POLICY_COMPLETED.
-#       auth_result must be either "allow" or "deny".
+#       Called from the APM iRule after ACCESS_POLICY_COMPLETED and ACCESS_SESSION_CLOSED.
 #
 #   /__partition__/MIDEYE_SHIELD_COMMON::RESET_STATS
 #       Resets all statistics counters to zero.
@@ -1029,13 +1032,17 @@ proc VALIDATE_LOGIN { client_ip } {
 # Report an authentication result for an IP back to the Shield API.
 #
 # Called from the APM iRule after ACCESS_POLICY_COMPLETED.
-# auth_result must be "allow" or "deny".
 # This is fire-and-forget - errors are logged but never propagated.
 # ---------------------------------------------------------------------------
-proc REPORT_AUTH_RESULT { client_ip auth_result } {
-    catch {
-        set status ""
+proc REPORT_AUTH_RESULT { client_ip } {
+    # Make sure we have not already reported the status of the authenticatoin to Shield
+    if {[ACCESS::session data get session.custom.shield.has_reported] == 1} {
+        return
+    }
 
+    set status ""
+
+    catch {
         set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
 
         if {$TOKEN == ""} {
@@ -1051,6 +1058,7 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
         set reason  [string tolower [ACCESS::session data get session.custom.shield.reason]]
         set method  [string tolower [ACCESS::session data get session.custom.shield.method]]
         set user    [ACCESS::session data get session.logon.last.username]
+        set outcome $reason
 
         if {$SALT == ""} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "username_salt is empty, consider setting a unique value in the Mideye Shield iApp"
@@ -1060,18 +1068,10 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
             set method "unknown"
         }
 
-        if {$reason == "success" || $auth_result == "allow"} {
-            set outcome "success"
-        } elseif {$reason == ""} {
+        if {$reason == ""} {
             # If the reason was not set, we just skip reporting
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Reason was not set, will skip reporting, ipAddress: '$client_ip', username: '$user'"
             return
-        } elseif {$reason == "user_not_found" && $user == ""} {
-            # If the user was not found and there where no user name defined,
-            # the logon page has most likely just been reloaded and we just ignore it
-            return
-        } else {
-            set outcome $reason
         }
 
         set hashed_user ""
@@ -1113,6 +1113,11 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
         # Fire and forget - catch but discard any error.
         catch {
             set status [call __hssr_irule__::http_req $ARGS]
+        }
+
+        if {$status != "" && $status < 400} {
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Setting 'session.custom.shield.has_reported' to 1"
+            ACCESS::session data set session.custom.shield.has_reported 1
         }
     } err
 

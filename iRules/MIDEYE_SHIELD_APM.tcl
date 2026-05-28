@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
-# Version : 0.9.3
+# Version : 0.9.4
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-22
+# Date    : 2026-05-28
 #
 # Purpose
 # -------
@@ -59,24 +59,19 @@
 
 when ACCESS_POLICY_AGENT_EVENT {
     # Only act on the validate_ip event triggered from the access profile.
-    if {[string toupper [ACCESS::policy agent_id]] == "MIDEYE_SHIELD-VALIDATE_IP"} {
+    set event [string toupper [ACCESS::policy agent_id]];
+    if {$event == "MIDEYE_SHIELD-VALIDATE_IP"} {
         set allow [call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]]
         ACCESS::session data set session.custom.shield.allow $allow
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Allow status set to '$allow'"
+    } elseif {$event == "MIDEYE_SHIELD-REPORT_AUTH_RESULT"} {
+        # Report the final authentication outcome back to the Shield API.
+        call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [ACCESS::session data get session.user.clientip]
     }
 }
 
 when ACCESS_POLICY_COMPLETED {
     # Report the final authentication outcome back to the Shield API.
-    # Map the APM policy result to "allow" or "deny" for the Shield API.
-    if {[ACCESS::session data get "session.user.sessionid"] != ""} {
-        set reason [string tolower [ACCESS::session data get session.custom.shield.reason]]
-
-        if {[ACCESS::policy result] == "allow" || $reason == "success"} {
-            call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "allow"
-        } else {
-            call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [IP::client_addr] "deny"
-        }
-    }
+    call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [ACCESS::session data get session.user.clientip]
 }
