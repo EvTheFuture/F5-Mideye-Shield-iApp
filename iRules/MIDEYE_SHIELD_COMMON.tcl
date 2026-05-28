@@ -50,6 +50,7 @@
 #                                 client_certificate
 #                                 password_only
 #                                 password_totp
+#                                 passwordless_eid
 #
 # session.custom.shield.reason  - Store ONE of the following authentication results
 #                                 -------------------------------------------------
