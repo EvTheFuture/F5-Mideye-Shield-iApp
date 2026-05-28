@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.13
+# Version : 0.9.14
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-22
+# Date    : 2026-05-28
 #
 # Purpose
 # -------
@@ -1096,6 +1096,8 @@ proc REPORT_AUTH_RESULT { client_ip auth_result } {
         append BODY "\}"
         append BODY "\]"
         append BODY "\}"
+
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', username: '$user'"
 
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
