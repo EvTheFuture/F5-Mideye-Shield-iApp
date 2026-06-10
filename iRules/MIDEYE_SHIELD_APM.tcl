@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
-# Version : 0.9.4
+# Version : 0.9.5
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-28
+# Date    : 2026-06-10
 #
 # Purpose
 # -------
@@ -66,12 +66,10 @@ when ACCESS_POLICY_AGENT_EVENT {
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Allow status set to '$allow'"
     } elseif {$event == "MIDEYE_SHIELD-REPORT_AUTH_RESULT"} {
-        # Report the final authentication outcome back to the Shield API.
-        call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [ACCESS::session data get session.user.clientip]
-    }
-}
+        set client_ip [ACCESS::session data get session.user.clientip]
+        set reported_by [ACCESS::session data get session.server.network.name]
 
-when ACCESS_POLICY_COMPLETED {
-    # Report the final authentication outcome back to the Shield API.
-    call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [ACCESS::session data get session.user.clientip]
+        # Report the final authentication outcome back to the Shield API.
+        call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT $client_ip $reported_by
+    }
 }

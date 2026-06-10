@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.15
+# Version : 0.9.16
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-28
+# Date    : 2026-06-10
 #
 # Purpose
 # -------
@@ -1034,7 +1034,7 @@ proc VALIDATE_LOGIN { client_ip } {
 # Called from the APM iRule after ACCESS_POLICY_COMPLETED.
 # This is fire-and-forget - errors are logged but never propagated.
 # ---------------------------------------------------------------------------
-proc REPORT_AUTH_RESULT { client_ip } {
+proc REPORT_AUTH_RESULT { client_ip { reported_by "" } } {
     # Make sure we have not already reported the status of the authenticatoin to Shield
     if {[ACCESS::session data get session.custom.shield.has_reported] == 1} {
         return
@@ -1088,6 +1088,10 @@ proc REPORT_AUTH_RESULT { client_ip } {
         append BODY ",\"authentication\": \{"
         append BODY "\"outcome\": \"$outcome\""
 
+        if {$reported_by != ""} {
+            append BODY ",\"enforcedBy\": {\"id\": \"$reported_by\"}"
+        }
+
         if {$hashed_user != ""} {
             append BODY ",\"usernameHash\": \"$hashed_user\""
         }
@@ -1101,7 +1105,7 @@ proc REPORT_AUTH_RESULT { client_ip } {
         append BODY "\]"
         append BODY "\}"
 
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', username: '$user'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', reported_by: '$reported_by', username: '$user'"
 
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"

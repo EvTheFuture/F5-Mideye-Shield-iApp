@@ -1,6 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
-# IAPP_VERSION: 1.0.1
-# IAPP_BUILD_DATE: 2026-05-28 17:09
+# IAPP_VERSION: 1.0.2
+# IAPP_BUILD_DATE: 2026-06-10 14:23
 
 cli admin-partitions {
     update-partition Common
@@ -237,10 +237,10 @@ set _SUBST_MAP [list "__log__debug__" "$::log__debug" \
 set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
-# Version : 0.9.4
-# iApp Version : 1.0.1
+# Version : 0.9.5
+# iApp Version : 1.0.2
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-28
+# Date    : 2026-06-10
 #
 # Purpose
 # -------
@@ -304,14 +304,12 @@ when ACCESS_POLICY_AGENT_EVENT {
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Allow status set to '$allow'"
     } elseif {$event == "MIDEYE_SHIELD-REPORT_AUTH_RESULT"} {
-        # Report the final authentication outcome back to the Shield API.
-        call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [ACCESS::session data get session.user.clientip]
-    }
-}
+        set client_ip [ACCESS::session data get session.user.clientip]
+        set reported_by [ACCESS::session data get session.server.network.name]
 
-when ACCESS_POLICY_COMPLETED {
-    # Report the final authentication outcome back to the Shield API.
-    call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT [ACCESS::session data get session.user.clientip]
+        # Report the final authentication outcome back to the Shield API.
+        call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT $client_ip $reported_by
+    }
 }
 
 }
@@ -320,10 +318,10 @@ when ACCESS_POLICY_COMPLETED {
 set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.15
-# iApp Version : 1.0.1
+# Version : 0.9.16
+# iApp Version : 1.0.2
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-05-28
+# Date    : 2026-06-10
 #
 # Purpose
 # -------
@@ -1355,7 +1353,7 @@ proc VALIDATE_LOGIN { client_ip } {
 # Called from the APM iRule after ACCESS_POLICY_COMPLETED.
 # This is fire-and-forget - errors are logged but never propagated.
 # ---------------------------------------------------------------------------
-proc REPORT_AUTH_RESULT { client_ip } {
+proc REPORT_AUTH_RESULT { client_ip { reported_by "" } } {
     # Make sure we have not already reported the status of the authenticatoin to Shield
     if {[ACCESS::session data get session.custom.shield.has_reported] == 1} {
         return
@@ -1409,6 +1407,10 @@ proc REPORT_AUTH_RESULT { client_ip } {
         append BODY ",\"authentication\": \{"
         append BODY "\"outcome\": \"$outcome\""
 
+        if {$reported_by != ""} {
+            append BODY ",\"enforcedBy\": {\"id\": \"$reported_by\"}"
+        }
+
         if {$hashed_user != ""} {
             append BODY ",\"usernameHash\": \"$hashed_user\""
         }
@@ -1422,7 +1424,7 @@ proc REPORT_AUTH_RESULT { client_ip } {
         append BODY "\]"
         append BODY "\}"
 
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', username: '$user'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', reported_by: '$reported_by', username: '$user'"
 
         # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
@@ -1532,7 +1534,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 1.0.1
+# iApp Version : 1.0.2
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -3090,8 +3092,8 @@ if { $::hssr__mode eq "install" } {
             presentation {
 
 section about {
-    message version "1.0.1"
-    message build_date "2026-05-28 17:09"
+    message version "1.0.2"
+    message build_date "2026-06-10 14:23"
 }
 section log {
     choice debug display "small" default "0" {
