@@ -45,8 +45,6 @@
 #
 # Session Variables
 # -----------------
-# session.custom.shield.has_reported  - Set to 1 if reported authentication status to Shield
-#
 # session.custom.shield.method        - Store ONE of the following values during authentication
 #                                       -------------------------------------------------------
 #                                       client_certificate
@@ -1035,11 +1033,6 @@ proc VALIDATE_LOGIN { client_ip } {
 # This is fire-and-forget - errors are logged but never propagated.
 # ---------------------------------------------------------------------------
 proc REPORT_AUTH_RESULT { client_ip { reported_by "" } } {
-    # Make sure we have not already reported the status of the authenticatoin to Shield
-    if {[ACCESS::session data get session.custom.shield.has_reported] == 1} {
-        return
-    }
-
     set status ""
 
     catch {
@@ -1117,11 +1110,6 @@ proc REPORT_AUTH_RESULT { client_ip { reported_by "" } } {
         # Fire and forget - catch but discard any error.
         catch {
             set status [call __hssr_irule__::http_req $ARGS]
-        }
-
-        if {$status != "" && $status < 400} {
-            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Setting 'session.custom.shield.has_reported' to 1"
-            ACCESS::session data set session.custom.shield.has_reported 1
         }
     } err
 
