@@ -213,6 +213,13 @@ when RULE_INIT {
 
     # Hashing
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
+
+    # Traffic Intelligence (client-fingerprint reporting; consumed by
+    # MIDEYE_SHIELD_TRAFFIC). Off unless traffic_enabled is 1.
+    set static::MIDEYE_SHIELD_traffic_enabled        "__traffic__enabled__"
+    set static::MIDEYE_SHIELD_traffic_batch_size     "__traffic__batch_size__"
+    set static::MIDEYE_SHIELD_traffic_flush_interval "__traffic__flush_interval__"
+    set static::MIDEYE_SHIELD_traffic_max_buffer     "__traffic__max_buffer__"
 }
 
 # ===========================================================================
