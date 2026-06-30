@@ -513,6 +513,8 @@ proc FLUSH_TRAFFIC {} {
 
     set BODY "\{\"events\":\[[join $events ,]\]\}"
 
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: flushing [llength $events] event(s) to /ips/events"
+
     catch {
         set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
         if { $TOKEN ne "" } {
@@ -585,6 +587,7 @@ when CLIENT_DATA {
         set ms_traffic_ja4         [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_COMPUTE_JA4 $hello]
         set ms_traffic_tls_version [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_MAP_TLS_VERSION [dict get $hello ver_2char]]
         set ms_traffic_alpn        [dict get $hello alpn_proto]
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: fingerprint src=[IP::client_addr] ja3=$ms_traffic_ja3 ja4=$ms_traffic_ja4 alpn=$ms_traffic_alpn"
     }
 
     TCP::release
