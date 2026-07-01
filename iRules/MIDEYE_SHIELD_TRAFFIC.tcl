@@ -127,7 +127,7 @@ proc _MAP_TLS_VERSION { v2 } {
 # proc: _PARSE_CLIENTHELLO
 #
 # Parse a complete TLS ClientHello record (already fully collected, length
-# bounded by total_needed) into a dict of the fields JA3 and JA4 need. Returns
+# bounded by total_needed) into a name/value list of the fields JA3 and JA4 need. Returns
 # "" if the payload is not a ClientHello or is malformed. GREASE values
 # (RFC 8701) are stripped from ciphers, extensions, curves and sig-algs.
 #
@@ -346,18 +346,21 @@ proc _PARSE_CLIENTHELLO { payload total_needed } {
         default { set ver_2char "00" }
     }
 
-    return [dict create \
-        ver_hex       $ver_hex \
-        ver_2char     $ver_2char \
-        tprt          $ja4_tprt \
-        has_sni       $has_sni \
-        alpn_2char    $alpn_2char \
-        alpn_proto    $alpn_proto \
-        ciphers_hex   $ciphers_hex \
-        exts_hex      $exts_hex \
-        curves_dec    $curves_dec \
-        pointfmts_dec $pointfmts_dec \
-        sigalgs_hex   $sigalgs_hex]
+    # BIG-IP TMM iRules run a Tcl 8.4 interpreter with no `dict` command, so the
+    # parsed fields are returned as a flat name/value list (array get) that the
+    # callers reload with `array set`. List-valued fields round-trip intact.
+    set out(ver_hex)       $ver_hex
+    set out(ver_2char)     $ver_2char
+    set out(tprt)          $ja4_tprt
+    set out(has_sni)       $has_sni
+    set out(alpn_2char)    $alpn_2char
+    set out(alpn_proto)    $alpn_proto
+    set out(ciphers_hex)   $ciphers_hex
+    set out(exts_hex)      $exts_hex
+    set out(curves_dec)    $curves_dec
+    set out(pointfmts_dec) $pointfmts_dec
+    set out(sigalgs_hex)   $sigalgs_hex
+    return [array get out]
 }
 
 # ---------------------------------------------------------------------------
@@ -367,18 +370,19 @@ proc _PARSE_CLIENTHELLO { payload total_needed } {
 # Each list is decimal, '-'-joined, GREASE already removed, original order
 # preserved (JA3 does not sort). The five fields are ','-joined.
 # ---------------------------------------------------------------------------
-proc _COMPUTE_JA3 { hello } {
+proc _COMPUTE_JA3 { hello_list } {
+    array set hello $hello_list
     set parts [list]
-    foreach h [dict get $hello ciphers_hex] { lappend parts [scan $h %x] }
+    foreach h $hello(ciphers_hex) { lappend parts [scan $h %x] }
     set ciphers [join $parts "-"]
 
     set parts [list]
-    foreach h [dict get $hello exts_hex] { lappend parts [scan $h %x] }
+    foreach h $hello(exts_hex) { lappend parts [scan $h %x] }
     set exts [join $parts "-"]
 
-    set curves [join [dict get $hello curves_dec] "-"]
-    set fmts   [join [dict get $hello pointfmts_dec] "-"]
-    set ver    [scan [dict get $hello ver_hex] %x]
+    set curves [join $hello(curves_dec) "-"]
+    set fmts   [join $hello(pointfmts_dec) "-"]
+    set ver    [scan $hello(ver_hex) %x]
 
     set ja3_str "${ver},${ciphers},${exts},${curves},${fmts}"
     binary scan [md5 $ja3_str] H* out
@@ -393,18 +397,19 @@ proc _COMPUTE_JA3 { hello } {
 #   b: sha256(comma-joined hex ciphers, sorted) truncated to 12
 #   c: sha256(sorted hex exts excluding 0000/0010 _ original-order sig algs)[:12]
 # ---------------------------------------------------------------------------
-proc _COMPUTE_JA4 { hello } {
-    set cl [dict get $hello ciphers_hex]
-    set el [dict get $hello exts_hex]
-    set sal [dict get $hello sigalgs_hex]
+proc _COMPUTE_JA4 { hello_list } {
+    array set hello $hello_list
+    set cl $hello(ciphers_hex)
+    set el $hello(exts_hex)
+    set sal $hello(sigalgs_hex)
 
     set cc [llength $cl]
     if { $cc > 99 } { set cc 99 }
     set ec [llength $el]
     if { $ec > 99 } { set ec 99 }
-    set sni [expr { [dict get $hello has_sni] ? "d" : "i" }]
+    if { $hello(has_sni) } { set sni "d" } else { set sni "i" }
 
-    set ja4_a "[dict get $hello tprt][dict get $hello ver_2char]${sni}[format %02d $cc][format %02d $ec][dict get $hello alpn_2char]"
+    set ja4_a "$hello(tprt)$hello(ver_2char)${sni}[format %02d $cc][format %02d $ec]$hello(alpn_2char)"
 
     set cipher_str [join [lsort $cl] ","]
     if { $cipher_str eq "" } {
@@ -593,8 +598,9 @@ when CLIENT_DATA {
     if { ![catch { set hello [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_PARSE_CLIENTHELLO $payload $total_needed] }] && $hello ne "" } {
         set ms_traffic_ja3         [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_COMPUTE_JA3 $hello]
         set ms_traffic_ja4         [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_COMPUTE_JA4 $hello]
-        set ms_traffic_tls_version [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_MAP_TLS_VERSION [dict get $hello ver_2char]]
-        set ms_traffic_alpn        [dict get $hello alpn_proto]
+        array set hello_fields $hello
+        set ms_traffic_tls_version [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_MAP_TLS_VERSION $hello_fields(ver_2char)]
+        set ms_traffic_alpn        $hello_fields(alpn_proto)
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: fingerprint src=[IP::client_addr] ja3=$ms_traffic_ja3 ja4=$ms_traffic_ja4 alpn=$ms_traffic_alpn"
     }
 
