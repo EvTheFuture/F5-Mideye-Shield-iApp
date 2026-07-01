@@ -1,0 +1,67 @@
+name: Validate iApp template
+
+# On PRs and pushes that touch the sources, regenerate MIDEYE_SHIELD.tmpl and confirm the
+# committed template is present and up to date. Fails if the sources don't build (the
+# generator's structure validation) or if the committed template is stale (someone edited an
+# iRule/setting but didn't re-run `make`). The build-date stamp is ignored in the comparison.
+on:
+  pull_request:
+    paths:
+      - "iRules/**"
+      - "iApp/builder/**"
+      - "iApp/MIDEYE_SHIELD.tmpl"
+      - "Makefile"
+      - ".github/workflows/validate-template.yml"
+  push:
+    branches: [master]
+    paths:
+      - "iRules/**"
+      - "iApp/builder/**"
+      - "iApp/MIDEYE_SHIELD.tmpl"
+      - "Makefile"
+      - ".github/workflows/validate-template.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Regenerate template and check it is up to date
+        run: |
+          set -euo pipefail
+          TMPL="iApp/MIDEYE_SHIELD.tmpl"
+          if [ ! -f "${TMPL}" ]; then
+            echo "::error::${TMPL} is missing — the generated template must be committed."; exit 1
+          fi
+          CUR="$(sed -n 's/^# IAPP_VERSION:[[:space:]]*//p' "${TMPL}" | head -1)"
+          if [ -z "${CUR}" ]; then
+            echo "::error::Could not read IAPP_VERSION from ${TMPL}"; exit 1
+          fi
+          echo "Committed template version: ${CUR}"
+
+          COMMITTED="$(mktemp)"
+          cp "${TMPL}" "${COMMITTED}"
+
+          # Regenerate in place at the SAME version (make writes to ${TMPL}); the generator's
+          # own structure validation fails the build on unbalanced braces / uncovered statics.
+          make VERSION="${CUR}"
+
+          # Compare, neutralising only the volatile build-date stamp (minute granularity).
+          norm() { sed -E 's/^# IAPP_BUILD_DATE:.*/# IAPP_BUILD_DATE:/; s/(message build_date ")[^"]*(")/\1\2/' "$1"; }
+          if ! diff <(norm "${COMMITTED}") <(norm "${TMPL}"); then
+            echo "::error::${TMPL} is out of date with its sources. Run 'make' locally and commit the regenerated template."
+            exit 1
+          fi
+          echo "Template is up to date. ✔"
