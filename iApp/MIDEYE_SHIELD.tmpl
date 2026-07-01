@@ -1,6 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
-# IAPP_VERSION: 1.1.1
-# IAPP_BUILD_DATE: 2026-06-30 14:51
+# IAPP_VERSION: 1.1.2
+# IAPP_BUILD_DATE: 2026-07-01 08:24
 
 cli admin-partitions {
     update-partition Common
@@ -242,7 +242,7 @@ set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
 # Version : 0.9.5
-# iApp Version : 1.1.1
+# iApp Version : 1.1.2
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-06-10
 #
@@ -323,7 +323,7 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
 # Version : 0.9.16
-# iApp Version : 1.1.1
+# iApp Version : 1.1.2
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-06-10
 #
@@ -1533,7 +1533,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 1.1.1
+# iApp Version : 1.1.2
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -1584,7 +1584,7 @@ set _BODY_MIDEYE_SHIELD_TRAFFIC {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_TRAFFIC
 # Version : 0.1.0
-# iApp Version : 1.1.1
+# iApp Version : 1.1.2
 # Author  : Mideye
 # Date    : 2026-06-30
 #
@@ -1659,10 +1659,18 @@ when RULE_INIT {
 # proc: _JSON_ESCAPE
 #
 # Escape a string for inclusion in a JSON double-quoted value. Backslash must
-# be mapped first so it does not double-escape the others.
+# be mapped first so it does not double-escape the others. All C0 control
+# characters (U+0000-U+001F) must be escaped or the value is invalid JSON -
+# attacker-controlled inputs (User-Agent, header names, URL path) can carry
+# raw control bytes, and one unescaped byte would make the whole batch POST
+# unparseable and drop up to 1000 buffered events.
 # ---------------------------------------------------------------------------
 proc _JSON_ESCAPE { s } {
-    return [string map [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t] $s]
+    set m [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t \b \\b \f \\f]
+    foreach c {0 1 2 3 4 5 6 7 11 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31} {
+        lappend m [format %c $c] [format {\u%04x} $c]
+    }
+    return [string map $m $s]
 }
 
 # ---------------------------------------------------------------------------
@@ -1742,10 +1750,10 @@ proc _PARSE_CLIENTHELLO { payload total_needed } {
     set cs_iter 0
     while { $off < $cs_end } {
         if { [incr cs_iter] > $max_iter } { break }
-        unset -nocomplain cs_int cs_hex
-        binary scan $payload @${off}SH4 cs_int cs_hex
+        unset -nocomplain cs_hex
+        binary scan $payload @${off}H4 cs_hex
         if { ![info exists cs_hex] || [string length $cs_hex] != 4 } { break }
-        set cs_int [expr { $cs_int & 0xffff }]
+        set cs_int [scan $cs_hex %x]
         incr off 2
         if { ($cs_int & 0x0f0f) == 0x0a0a && (($cs_int >> 8) & 0xff) == ($cs_int & 0xff) } {
             continue
@@ -1778,10 +1786,10 @@ proc _PARSE_CLIENTHELLO { payload total_needed } {
             set ext_iter 0
             while { $off + 4 <= $ext_end } {
                 if { [incr ext_iter] > $max_iter } { break }
-                unset -nocomplain et_int et_hex
-                binary scan $payload @${off}SH4 et_int et_hex
+                unset -nocomplain et_hex
+                binary scan $payload @${off}H4 et_hex
                 if { ![info exists et_hex] || [string length $et_hex] != 4 } { break }
-                set et_int [expr { $et_int & 0xffff }]
+                set et_int [scan $et_hex %x]
                 incr off 2
                 binary scan $payload @${off}S et_len
                 set et_len [expr { $et_len & 0xffff }]
@@ -1846,10 +1854,10 @@ proc _PARSE_CLIENTHELLO { payload total_needed } {
                                 set sa_iter 0
                                 while { $sa_off + 2 <= $sa_end } {
                                     if { [incr sa_iter] > $max_iter } { break }
-                                    unset -nocomplain sa_int sa_hex
-                                    binary scan $payload @${sa_off}SH4 sa_int sa_hex
+                                    unset -nocomplain sa_hex
+                                    binary scan $payload @${sa_off}H4 sa_hex
                                     if { ![info exists sa_hex] || [string length $sa_hex] != 4 } { break }
-                                    set sa_int [expr { $sa_int & 0xffff }]
+                                    set sa_int [scan $sa_hex %x]
                                     incr sa_off 2
                                     if { ($sa_int & 0x0f0f) == 0x0a0a && (($sa_int >> 8) & 0xff) == ($sa_int & 0xff) } { continue }
                                     lappend sigalgs_hex $sa_hex
@@ -1892,10 +1900,10 @@ proc _PARSE_CLIENTHELLO { payload total_needed } {
                                 set sv_iter 0
                                 while { $sv_off + 2 <= $sv_end } {
                                     if { [incr sv_iter] > $max_iter } { break }
-                                    unset -nocomplain sv_int sv_hex
-                                    binary scan $payload @${sv_off}SH4 sv_int sv_hex
+                                    unset -nocomplain sv_hex
+                                    binary scan $payload @${sv_off}H4 sv_hex
                                     if { ![info exists sv_hex] || [string length $sv_hex] != 4 } { break }
-                                    set sv_int [expr { $sv_int & 0xffff }]
+                                    set sv_int [scan $sv_hex %x]
                                     incr sv_off 2
                                     if { ($sv_int & 0x0f0f) == 0x0a0a && (($sv_int >> 8) & 0xff) == ($sv_int & 0xff) } { continue }
                                     lappend sv_list $sv_hex
@@ -3791,8 +3799,8 @@ if { $::hssr__mode eq "install" } {
             presentation {
 
 section about {
-    message version "1.1.1"
-    message build_date "2026-06-30 14:51"
+    message version "1.1.2"
+    message build_date "2026-07-01 08:24"
 }
 section log {
     choice debug display "small" default "0" {
