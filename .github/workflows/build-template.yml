@@ -1,0 +1,78 @@
+name: Build iApp template
+
+# Manually build MIDEYE_SHIELD.tmpl and publish it as a downloadable artifact for
+# manual import onto a BIG-IP. It does NOT deploy anywhere and does NOT commit the
+# regenerated template — installation stays a manual, customer-equivalent step.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Template version, e.g. 1.1.3 (blank = bump the committed template's patch)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            VER="${INPUT_VERSION}"
+          else
+            CUR="$(sed -n 's/^# IAPP_VERSION:[[:space:]]*//p' iApp/MIDEYE_SHIELD.tmpl | head -1)"
+            if [ -z "${CUR}" ]; then
+              echo "::error::Could not read IAPP_VERSION from iApp/MIDEYE_SHIELD.tmpl"; exit 1
+            fi
+            MAJ="$(printf '%s' "${CUR}" | cut -d. -f1)"
+            MIN="$(printf '%s' "${CUR}" | cut -d. -f2)"
+            PAT="$(printf '%s' "${CUR}" | cut -d. -f3)"
+            VER="${MAJ}.${MIN}.$((PAT + 1))"
+          fi
+          if ! printf '%s' "${VER}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '${VER}' must be MAJOR.MINOR.PATCH (digits only)"; exit 1
+          fi
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "Building template version ${VER}"
+
+      - name: Build template
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: make VERSION="${VERSION}"
+
+      - name: Upload template artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIDEYE_SHIELD-${{ steps.ver.outputs.version }}
+          path: iApp/MIDEYE_SHIELD.tmpl
+          if-no-files-found: error
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "### Built \`MIDEYE_SHIELD.tmpl\` v${VERSION}"
+            echo ""
+            echo "Download the **MIDEYE_SHIELD-${VERSION}** artifact from this run, then on the BIG-IP:"
+            echo "**iApps ›› Templates ›› Import** → select the file."
+            echo ""
+            echo "_No deployment happens here — installation is manual by design._"
+          } >> "${GITHUB_STEP_SUMMARY}"
