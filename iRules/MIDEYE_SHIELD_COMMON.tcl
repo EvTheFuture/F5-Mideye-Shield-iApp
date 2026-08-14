@@ -213,11 +213,38 @@ when RULE_INIT {
 
     # Hashing
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
+
+    # Escape map for JSON string values, built once here rather than per call.
+    #
+    # Every byte outside printable ASCII is escaped, not just the C0 controls: a
+    # single byte that is not valid UTF-8 makes the whole batch POST unparseable,
+    # dropping every other event buffered with it. \u00xx keeps the byte value
+    # and is always valid JSON.
+    #
+    # Not an iApp setting: the generator's cross-check only matches statics whose
+    # value is a double-quoted string, so this list is invisible to it.
+    set static::MIDEYE_SHIELD_json_map [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t \b \\b \f \\f]
+    for { set c 0 } { $c < 256 } { incr c } {
+        if { $c >= 0x20 && $c < 0x7f } { continue }
+        if { $c == 8 || $c == 9 || $c == 10 || $c == 12 || $c == 13 } { continue }
+        lappend static::MIDEYE_SHIELD_json_map \
+            [format %c $c] [format {\u%04x} $c]
+    }
 }
 
 # ===========================================================================
 # P R I V A T E   P R O C E D U R E S
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# proc: _JSON_ESCAPE
+#
+# Escape a string for inclusion in a JSON double-quoted value, using the map
+# built in RULE_INIT (see there for why non-ASCII is escaped too).
+# ---------------------------------------------------------------------------
+proc _JSON_ESCAPE { s } {
+    return [string map $static::MIDEYE_SHIELD_json_map $s]
+}
 
 # ---------------------------------------------------------------------------
 # proc:_LOG_COMMON
