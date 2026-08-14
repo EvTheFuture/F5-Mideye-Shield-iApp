@@ -1078,6 +1078,13 @@ proc _VALIDATE { client_ip cache_time } {
     if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_BLACKLIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
 
+        # The counter is incremented above the dry-run check, as on the score
+        # branch, so dry run still counts what it would have denied.
+        if {$DRY_RUN == "1"} {
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied '$client_ip' due to blacklist match"
+            return 1
+        }
+
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 2 (Blacklisted)"
         return 0
