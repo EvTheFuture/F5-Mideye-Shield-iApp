@@ -247,6 +247,181 @@ proc _JSON_ESCAPE { s } {
 }
 
 # ---------------------------------------------------------------------------
+# proc: _ENQUEUE_EVENT
+#
+# Append one event (JSON string) to the buffer in subtable "sub". Drops the
+# event (fail-open, counted) when the buffer is at capacity. Triggers a flush
+# when the buffer reaches batch_size OR flush_interval has elapsed since the
+# last flush (the time trigger fires on the next event after T - a truly idle
+# buffer self-expires via the per-event TTL).
+#
+# Sizing arrives as arguments rather than statics so each caller owns its own
+# buffer settings and its own subtable.
+# ---------------------------------------------------------------------------
+proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
+    set N      $batch_size
+    set T      $flush_interval
+    set MAXBUF $max_buffer
+
+    # These come from free-text iApp fields. Tcl compares a non-numeric operand
+    # as a string rather than failing, so a typo like "1,000" would quietly make
+    # every comparison below meaningless; fall back to the defaults instead of
+    # reporting nothing at all.
+    if { ![string is integer -strict $N]      || $N < 1 }      { set N 200 }
+    if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
+    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 1000 }
+
+    # A batch size above the cap can never be reached: events are dropped at the
+    # cap long before the batch fills, leaving the timer as the only trigger.
+    if { $N > $MAXBUF } { set N $MAXBUF }
+
+    # An event has to outlive the interval it is waiting for. Deriving the TTL
+    # from T rather than fixing it means raising the flush interval cannot
+    # silently expire the very buffer that interval exists to accumulate.
+    set TTL [expr { $T * 2 + 60 }]
+
+    set seq [table incr -subtable $sub "seq"]
+    if { $seq == 1 } {
+        table set -subtable $sub "seq" 1 indefinite indefinite
+    }
+
+    set cursor [table lookup -subtable $sub "cursor"]
+    if { $cursor eq "" } { set cursor 0 }
+    set buffered [expr { $seq - $cursor }]
+
+    # Over capacity: drop this event, but still fall through to the flush
+    # trigger below. Returning here would be terminal - the cursor only ever
+    # advances in _FLUSH_EVENTS, so skipping the trigger leaves nothing that can
+    # ever bring the buffer back under the cap.
+    if { $buffered > $MAXBUF } {
+        table incr -subtable $sub "dropped"
+    } else {
+        table set -subtable $sub "evt_$seq" $event_json $TTL $TTL
+    }
+
+    set last [table lookup -subtable $sub "last_flush"]
+    if { $last eq "" } { set last 0 }
+
+    if { $buffered >= $N || ([clock seconds] - $last) >= $T } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_EVENTS $sub
+    }
+}
+
+# ---------------------------------------------------------------------------
+# proc: _RELEASE_FLUSH_LOCK
+#
+# Release the flush lock only if we still hold it. A flush that overran its lock
+# TTL has already been replaced by another flusher; deleting the entry then
+# would free THEIR lock and let a third run alongside them.
+# ---------------------------------------------------------------------------
+proc _RELEASE_FLUSH_LOCK { sub tok } {
+    if { [table lookup -subtable $sub "flush_lock"] eq $tok } {
+        table delete -subtable $sub "flush_lock"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# proc: _FLUSH_EVENTS
+#
+# Gather up to 1000 buffered events (the Shield API per-request cap) into one
+# {"events":[...]} body and POST it once over HSSR. A ticket lock serialises
+# flushers device-wide. Fire-and-forget: a failed POST drops that batch rather
+# than retrying, keeping the buffer bounded - but it says so out loud, because
+# by then the events are gone.
+# ---------------------------------------------------------------------------
+proc _FLUSH_EVENTS { sub } {
+    set TIMEOUT  $static::MIDEYE_SHIELD_api_timeout
+    set LOCK_TTL [expr { int($TIMEOUT / 1000) + 5 }]
+
+    # `table add` will not overwrite an existing entry, but what it returns when
+    # it declines is not specified firmly enough to bet a lock on. Claim a ticket
+    # no other flusher can hold, then require it back: another flusher's ticket
+    # is not ours, and neither is an empty result.
+    set tok [table incr -subtable $sub "ticket"]
+    if { $tok == 1 } {
+        table set -subtable $sub "ticket" 1 indefinite indefinite
+    }
+    if { [table add -subtable $sub "flush_lock" $tok $LOCK_TTL $LOCK_TTL] ne $tok } {
+        return
+    }
+
+    set cursor [table lookup -subtable $sub "cursor"]
+    if { $cursor eq "" } { set cursor 0 }
+    set seq [table lookup -subtable $sub "seq"]
+    if { $seq eq "" } { set seq 0 }
+
+    set end $seq
+    if { [expr { $end - $cursor }] > 1000 } {
+        set end [expr { $cursor + 1000 }]
+    }
+
+    # A missing entry is either an event dropped at the cap or one whose sequence
+    # number is already claimed but whose body has not landed yet; from here the
+    # two look identical. Both are skipped rather than waited for - stopping at a
+    # gap would wedge the cursor permanently the first time an entry expired.
+    set events [list]
+    for { set s [expr { $cursor + 1 }] } { $s <= $end } { incr s } {
+        set j [table lookup -subtable $sub "evt_$s"]
+        if { $j ne "" } {
+            lappend events $j
+            table delete -subtable $sub "evt_$s"
+        }
+    }
+
+    table set -subtable $sub "cursor" $end indefinite indefinite
+    table set -subtable $sub "last_flush" [clock seconds] indefinite indefinite
+
+    # Report overflow here rather than leaving it in a table key nothing reads.
+    # Once per flush is rate-limited by construction, and a buffer that is
+    # dropping events is the one thing an operator needs to be told.
+    set dropped [table lookup -subtable $sub "dropped"]
+    if { $dropped ne "" && $dropped > 0 } {
+        table delete -subtable $sub "dropped"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: buffer full, dropped $dropped event(s) since the last flush"
+    }
+
+    if { [llength $events] == 0 } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $tok
+        return
+    }
+
+    set BODY "\{\"events\":\[[join $events ,]\]\}"
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "$sub: flushing [llength $events] event(s) to /ips/events"
+
+    # The events are already deleted and the cursor already advanced, so this
+    # batch is gone whatever happens next. Anything that goes wrong has to be
+    # said out loud: a Shield API that rejects every POST is otherwise
+    # indistinguishable from a healthy iApp seeing no traffic.
+    set failure ""
+    if { [catch {
+        set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
+        if { $TOKEN eq "" } {
+            set failure "no valid API token"
+        } else {
+            set BASE_URL $static::MIDEYE_SHIELD_api_base_url
+            call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}/ips/events"
+            lappend ARGS \
+                -headers [list "Authorization" "Bearer ${TOKEN}"] \
+                -body    $BODY \
+                -type    "application/json"
+            set STATUS [call __hssr_irule__::http_req $ARGS]
+            if { $STATUS ne "" && ![string match "2*" $STATUS] } {
+                set failure "HTTP $STATUS"
+            }
+        }
+    } err] } {
+        set failure $err
+    }
+
+    if { $failure ne "" } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: dropped [llength $events] event(s) -> $failure"
+    }
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $tok
+}
+
+# ---------------------------------------------------------------------------
 # proc:_LOG_COMMON
 #
 # DO NOT USE, this is an INTERNAL PROCEDURE
