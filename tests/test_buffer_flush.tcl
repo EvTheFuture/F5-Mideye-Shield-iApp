@@ -44,8 +44,9 @@ proc logged {pattern} {
 }
 proc tbl {key} { return [table lookup -subtable $::SUB $key] }
 
-set static::MIDEYE_SHIELD_api_timeout  5000
-set static::MIDEYE_SHIELD_api_base_url "https://shield.example.com/api"
+set static::MIDEYE_SHIELD_api_timeout     5000
+set static::MIDEYE_SHIELD_api_base_url    "https://shield.example.com/api"
+set static::MIDEYE_SHIELD_api_retry_after 30
 
 set ::N 200
 set ::T 10
@@ -161,6 +162,36 @@ assert {[logged "*no valid API token*"] == 1} "a missing token is reported"
 assert {[llength $::POSTS] == 0} "no POST is attempted without a token"
 assert {[tbl "cursor"] eq "" || [tbl "cursor"] == 0} "a missing token does not advance the cursor"
 assert {[tbl "evt_1"] eq {{"a":1}}} "a missing token leaves the event buffered for the next flush"
+
+# The token path is the one exit that leaves last_flush untouched, so the timer
+# stays due; unthrottled, every further event would cost another token request
+# on the same sideband path score lookups use.
+set ::LOGS [list]
+enq {{"a":2}}
+enq {{"a":3}}
+assert {[logged "*no valid API token*"] == 0} "a token outage is not re-reported on every event"
+assert {[tbl "evt_3"] eq {{"a":3}}} "events still buffer while backed off"
+
+# Recovery has to be automatic: a backoff that outlived the outage would be
+# indistinguishable from reporting being switched off.
+set ::TOKEN "tok-123"
+enq {{"a":4}}
+assert {[llength $::POSTS] == 0} "the backoff still holds before it expires"
+advance 31
+enq {{"a":5}}
+assert {[llength $::POSTS] == 1} "flushing resumes once the backoff expires"
+assert {[post_body 0] eq {{"events":[{"a":1},{"a":2},{"a":3},{"a":4},{"a":5}]}}} "every event held during the outage is sent"
+
+# An unusable retry_after must not disable reporting outright.
+reset 1 10 1000
+set static::MIDEYE_SHIELD_api_retry_after "not a number"
+set ::TOKEN ""
+enq {{"a":1}}
+set static::MIDEYE_SHIELD_api_retry_after 30
+set ::TOKEN "tok-123"
+advance 31
+enq {{"a":2}}
+assert {[llength $::POSTS] == 1} "a non-numeric retry_after falls back to the default backoff"
 
 # --- gaps -------------------------------------------------------------------
 # Stopping at a gap would wedge the cursor permanently the first time an entry

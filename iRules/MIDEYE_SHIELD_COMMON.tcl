@@ -1,6 +1,6 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.17
+# Version : 0.9.18
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-08-14
 #
@@ -364,6 +364,13 @@ proc _RELEASE_FLUSH_LOCK { sub tok } {
 # consuming anything, so the batch outlives the outage.
 # ---------------------------------------------------------------------------
 proc _FLUSH_EVENTS { sub } {
+    # Set only by the token-outage path below, which is the one exit that leaves
+    # last_flush untouched: without this gate the timer stays permanently due
+    # and every buffered event costs another doomed token request. Those share
+    # the sideband path with score lookups, so an outage would degrade the
+    # blocking itself - a reporting failure must not reach that far.
+    if { [table lookup -subtable $sub "backoff"] ne "" } { return }
+
     set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
 
     # From a free-text iApp field. A non-numeric value would throw out of the
@@ -401,7 +408,17 @@ proc _FLUSH_EVENTS { sub } {
     }
 
     if { $TOKEN eq "" } {
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: no valid API token, keeping buffered event(s) for the next flush"
+        set RETRY $static::MIDEYE_SHIELD_api_retry_after
+
+        # Free-text iApp field, as with the buffer settings above.
+        if { ![string is integer -strict $RETRY] || $RETRY < 1 } { set RETRY 30 }
+
+        # Deliberately not _MARK_API_DOWN: that is the score path's breaker, and
+        # failing to report must never make the iApp stop scoring. The backoff
+        # is per-buffer and only ever suppresses reporting.
+        table set -subtable $sub "backoff" 1 $RETRY $RETRY
+
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: no valid API token, keeping buffered event(s) and backing off ${RETRY}s"
         call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $tok
         return
     }
@@ -737,10 +754,13 @@ proc _IS_API_DOWN {} {
 # Return a valid API access token, fetching a new one if needed.
 #
 # Uses a binary "token_fetching" lock to prevent concurrent refresh storms.
-# The lock is claimed with "table add" which is an atomic test-and-set:
-# it only writes if the key is absent and returns the existing value if not.
-# A caller that finds the key already present knows another context owns the
-# fetch and polls until the new token appears or the timeout is exhausted.
+# The lock is claimed with "table add", which writes only if the key is absent,
+# and ownership is decided from what that call returns. Note the limitation:
+# the sentinel written is 1, so under the reading where a declined add returns
+# the existing value, owning and not owning are indistinguishable and every
+# racing context fetches. The lock then damps nothing, though each caller still
+# ends up with a valid token. A caller that does not win polls until the new
+# token appears or the timeout is exhausted.
 #
 # Returns empty string on failure.
 # ---------------------------------------------------------------------------
@@ -1168,8 +1188,7 @@ proc _VALIDATE { client_ip cache_time } {
     if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_BLACKLIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
 
-        # The counter is incremented above the dry-run check, as on the score
-        # branch, so dry run still counts what it would have denied.
+        # Above the dry-run check, as on the score branch.
         if {$DRY_RUN == "1"} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied '$client_ip' due to blacklist match"
             return 1
