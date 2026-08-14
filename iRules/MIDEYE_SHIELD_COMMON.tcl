@@ -1,6 +1,6 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.17
+# Version : 0.9.18
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-08-14
 #
@@ -231,10 +231,10 @@ when RULE_INIT {
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
 
     # Blocked-event reporting
-    set static::MIDEYE_SHIELD_block_enabled        "__block__enabled__"
-    set static::MIDEYE_SHIELD_block_batch_size     "__block__batch_size__"
-    set static::MIDEYE_SHIELD_block_flush_interval "__block__flush_interval__"
-    set static::MIDEYE_SHIELD_block_max_buffer     "__block__max_buffer__"
+    set static::MIDEYE_SHIELD_block_enabled          "__block__enabled__"
+    set static::MIDEYE_SHIELD_block_batch_size       "__block__batch_size__"
+    set static::MIDEYE_SHIELD_block_flush_interval   "__block__flush_interval__"
+    set static::MIDEYE_SHIELD_block_max_buffer       "__block__max_buffer__"
 
     # Escape map for JSON string values. Every byte outside printable ASCII
     # is escaped because one byte of invalid UTF-8 makes an entire batch
