@@ -111,7 +111,18 @@ assert {[tbl "dropped"] ne "" && [tbl "dropped"] > 0} "events over the cap are d
 table delete -subtable $::SUB "flush_lock"
 advance 10
 enq {{"a":6}}
-assert {[logged "*dropped*"] == 1} "an overflowing buffer says so"
+assert {[logged "*buffer full*"] == 1} "an overflowing buffer says so"
+
+# --- per-request cap --------------------------------------------------------
+# The Shield API takes at most 1000 events per request, so a backlog has to go
+# out in slices rather than in one oversized POST.
+reset 100000 10 5000
+for { set i 1 } { $i <= 1002 } { incr i } { enq [format {{"a":%d}} $i] }
+assert {[llength $::POSTS] == 0} "a backlog under the batch size does not flush"
+advance 10
+enq [format {{"a":%d}} 1003]
+assert {[llength $::POSTS] == 1} "the elapsed interval flushes the backlog"
+assert {[tbl "cursor"] == 1000} "a flush sends at most 1000 events"
 
 # --- flush lock -------------------------------------------------------------
 foreach mode {1 0} {

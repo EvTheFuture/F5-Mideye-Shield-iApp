@@ -280,10 +280,11 @@ proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
     # silently expire the very buffer that interval exists to accumulate.
     set TTL [expr { $T * 2 + 60 }]
 
+    # Seed with `table add` rather than pinning after the fact: `table incr`
+    # then `table set ... 1` loses an increment when two callers race at cold
+    # start, and two events then claim the same sequence number.
+    table add -subtable $sub "seq" 0 indefinite indefinite
     set seq [table incr -subtable $sub "seq"]
-    if { $seq == 1 } {
-        table set -subtable $sub "seq" 1 indefinite indefinite
-    }
 
     set cursor [table lookup -subtable $sub "cursor"]
     if { $cursor eq "" } { set cursor 0 }
@@ -330,18 +331,28 @@ proc _RELEASE_FLUSH_LOCK { sub tok } {
 # by then the events are gone.
 # ---------------------------------------------------------------------------
 proc _FLUSH_EVENTS { sub } {
-    set TIMEOUT  $static::MIDEYE_SHIELD_api_timeout
+    set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
+
+    # From a free-text iApp field. A non-numeric value would throw out of the
+    # expr below, which sits outside this proc's catch, aborting the caller's
+    # iRule event - fail-closed, in a fail-open feature.
+    if { ![string is integer -strict $TIMEOUT] || $TIMEOUT < 1 } { set TIMEOUT 2500 }
+
     set LOCK_TTL [expr { int($TIMEOUT / 1000) + 5 }]
 
-    # `table add` will not overwrite an existing entry, but what it returns when
-    # it declines is not specified firmly enough to bet a lock on. Claim a ticket
-    # no other flusher can hold, then require it back: another flusher's ticket
-    # is not ours, and neither is an empty result.
+    # Cold-start race: `table incr` then `table set ... 1` loses an increment
+    # when two flushers arrive together, and a duplicated ticket lets both hold
+    # the lock at once and POST the same events twice. Seeding with `table add`
+    # establishes the indefinite lifetime before any increment.
+    table add -subtable $sub "ticket" 0 indefinite indefinite
     set tok [table incr -subtable $sub "ticket"]
-    if { $tok == 1 } {
-        table set -subtable $sub "ticket" 1 indefinite indefinite
-    }
-    if { [table add -subtable $sub "flush_lock" $tok $LOCK_TTL $LOCK_TTL] ne $tok } {
+
+    # `table add` will not overwrite an existing entry, but what it returns is
+    # not specified firmly enough to bet a lock on - in either direction. Claim
+    # a ticket no other flusher can hold, then read the lock back: only the
+    # holder sees its own ticket, whatever add returned.
+    table add -subtable $sub "flush_lock" $tok $LOCK_TTL $LOCK_TTL
+    if { [table lookup -subtable $sub "flush_lock"] ne $tok } {
         return
     }
 
