@@ -1,6 +1,6 @@
 #TMSH-VERSION: 14.0.0
 # IAPP_VERSION: 1.0.4
-# IAPP_BUILD_DATE: 2026-08-14 16:27
+# IAPP_BUILD_DATE: 2026-08-14 16:33
 
 cli admin-partitions {
     update-partition Common
@@ -377,9 +377,9 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 # The token_fetching sentinel uses "table add" (-excl semantics) rather than
 # incr, because it is a binary lock, not a counter. "table add" only writes
 # if the key does not already exist. This gives a single atomic test-and-set
-# with no read-modify-write gap. What it returns when the key already exists
-# is not clearly documented, so the event flush lock claims a unique ticket
-# and reads the key back instead of trusting the return value.
+# with no read-modify-write gap. Its return value on decline is not
+# documented, so the event flush lock claims a unique ticket and reads the
+# key back instead.
 #
 #
 # Session Variables
@@ -572,11 +572,9 @@ when RULE_INIT {
     set static::MIDEYE_SHIELD_block_flush_interval "__block__flush_interval__"
     set static::MIDEYE_SHIELD_block_max_buffer     "__block__max_buffer__"
 
-    # Escape map for JSON string values, built once at load time. Every byte
-    # outside printable ASCII is escaped, not just the C0 controls, because
-    # one byte of invalid UTF-8 makes an entire batch POST unparseable and
-    # \u00xx is always valid JSON. The generator's RULE_INIT cross-check only
-    # matches double-quoted statics and ignores this list.
+    # Escape map for JSON string values. Every byte outside printable ASCII
+    # is escaped because one byte of invalid UTF-8 makes an entire batch
+    # POST unparseable. The generator's cross-check ignores this static.
     set static::MIDEYE_SHIELD_json_map [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t \b \\b \f \\f]
     for { set c 0 } { $c < 256 } { incr c } {
         if { $c >= 0x20 && $c < 0x7f } { continue }
@@ -603,23 +601,19 @@ proc _JSON_ESCAPE { value } {
 # ---------------------------------------------------------------------------
 # proc: _ENQUEUE_EVENT
 #
-# Append one event (a JSON object string) to the buffer in subtable "sub".
-# Triggers a flush when the buffer reaches batch_size or when flush_interval
-# has elapsed since the last flush. The time trigger fires on the next event
-# after the interval. When the buffer is full the event is dropped and
-# counted instead of queued without limit.
-#
-# Sizing comes in as arguments so each caller owns its own buffer settings
-# and its own subtable.
+# Append one event (a JSON object string) to the buffer in subtable "sub"
+# and flush once batch_size events are buffered or flush_interval has passed
+# since the last flush. There is no timer, the time trigger fires on the
+# next event. When the buffer is full the event is dropped and counted.
+# Sizing comes as arguments so each caller owns its own buffer.
 # ---------------------------------------------------------------------------
 proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
     set N      $batch_size
     set T      $flush_interval
     set MAXBUF $max_buffer
 
-    # The sizes come from free-text iApp fields and Tcl compares a
-    # non-numeric operand as a string without failing. Fall back to the
-    # defaults rather than silently comparing garbage.
+    # The sizes come from free-text iApp fields. Fall back to the defaults
+    # rather than let Tcl compare non-numbers as strings.
     if { ![string is integer -strict $N]      || $N < 1 }      { set N 200 }
     if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
     if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 1000 }
@@ -627,12 +621,10 @@ proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
     # A batch size above the buffer cap could never be reached.
     if { $N > $MAXBUF } { set N $MAXBUF }
 
-    # An event must outlive the interval it is waiting for, so the TTL
-    # follows T instead of being fixed.
+    # An event must outlive the interval it is waiting for.
     set TTL [expr { $T * 2 + 60 }]
 
-    # Seed with "table add" so two callers racing at cold start cannot claim
-    # the same sequence number.
+    # Seed with "table add" so racing callers cannot claim the same number.
     table add -subtable $sub "seq" 0 indefinite indefinite
     set SEQ [table incr -subtable $sub "seq"]
 
@@ -640,9 +632,8 @@ proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
     if { $CURSOR eq "" } { set CURSOR 0 }
     set BUFFERED [expr { $SEQ - $CURSOR }]
 
-    # When over capacity, drop the event but still fall through to the flush
-    # trigger. Only _FLUSH_EVENTS advances the cursor, so returning early
-    # would leave a full buffer nothing can ever recover.
+    # Drop the event but still fall through to the flush trigger. Returning
+    # early would leave a full buffer nothing can ever drain.
     if { $BUFFERED > $MAXBUF } {
         # Seeded like seq so the counter cannot expire between flushes.
         table add -subtable $sub "dropped" 0 indefinite indefinite
@@ -677,45 +668,36 @@ proc _RELEASE_FLUSH_LOCK { sub ticket } {
 #
 # Collect up to 1000 buffered events (the Shield API per request cap) into
 # one {"events":[...]} body and POST it once over HSSR. A ticket lock
-# serialises flushers within one TMM. The session table is per TMM, so an
-# N-TMM box holds N independent buffers.
+# serialises flushers within one TMM (the session table is per TMM).
 #
-# Fire and forget. A failed POST drops that batch and logs a warning rather
-# than retrying, keeping the buffer bounded. A flush with no API token is
-# the one exception: it keeps the batch and backs off.
+# Fire and forget: a failed POST drops the batch and logs a warning. The
+# exception is a missing API token, which keeps the batch and backs off.
 # ---------------------------------------------------------------------------
 proc _FLUSH_EVENTS { sub } {
-    # Set below when no token could be fetched. That path leaves last_flush
-    # unwritten, so the timer stays due and without this gate every new
-    # event would trigger another doomed token fetch, stalling the caller
-    # for up to api_timeout per blocked connection. A reporting failure must
-    # never delay the block it is reporting.
+    # Without this gate a token outage would cost one doomed token fetch per
+    # event, stalling the caller up to api_timeout per blocked connection.
     if { [table lookup -subtable $sub "backoff"] ne "" } { return }
 
     set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
 
-    # A non-numeric value would throw out of the expr below and abort the
-    # caller's iRule event.
+    # A non-numeric value would throw below and abort the caller's event.
     if { ![string is integer -strict $TIMEOUT] || $TIMEOUT < 1 } { set TIMEOUT 2500 }
 
     set LOCK_TTL [expr { int($TIMEOUT / 1000) + 5 }]
 
-    # Seed with "table add" so two flushers racing at cold start cannot
-    # claim the same ticket and hold the lock together.
+    # Seed with "table add" so racing flushers cannot claim the same ticket.
     table add -subtable $sub "ticket" 0 indefinite indefinite
     set TICKET [table incr -subtable $sub "ticket"]
 
-    # "table add" never overwrites, but what it returns for an existing key
-    # is not clearly documented. Read the lock back instead: only the holder
-    # sees its own ticket.
+    # What a declined add returns is not documented, so read the lock back.
+    # Only the holder sees its own ticket.
     table add -subtable $sub "flush_lock" $TICKET $LOCK_TTL $LOCK_TTL
     if { [table lookup -subtable $sub "flush_lock"] ne $TICKET } {
         return
     }
 
-    # Fetch the token before the batch is consumed. Everything below
-    # destroys the events, so with no token we give up here and leave the
-    # buffer intact for the next flush.
+    # Everything below destroys the events, so with no token give up here
+    # and leave the buffer intact for the next flush.
     set TOKEN ""
     if { [catch { set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN] } ERR] } {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: token lookup failed -> $ERR"
@@ -725,16 +707,13 @@ proc _FLUSH_EVENTS { sub } {
     if { $TOKEN eq "" } {
         set RETRY $static::MIDEYE_SHIELD_api_retry_after
 
-        # Free-text iApp field, validated like the buffer settings above.
         if { ![string is integer -strict $RETRY] || $RETRY < 1 } { set RETRY 30 }
 
-        # Cap the backoff below the event TTL (flush_interval * 2 + 60, so
-        # at least 62s). A longer hold would expire events mid-backoff and
-        # they would be skipped later as gaps, with no drop count.
+        # Keep the backoff below the event TTL (at least 62s) or held events
+        # would expire and be lost as gaps, with no drop count.
         if { $RETRY > 60 } { set RETRY 60 }
 
-        # Not _MARK_API_DOWN, which is the score path's breaker. A reporting
-        # failure must never stop scoring.
+        # Not _MARK_API_DOWN: a reporting failure must never stop scoring.
         table set -subtable $sub "backoff" 1 $RETRY $RETRY
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: no valid API token, keeping buffered event(s) and backing off ${RETRY}s"
@@ -752,8 +731,8 @@ proc _FLUSH_EVENTS { sub } {
         set END [expr { $CURSOR + 1000 }]
     }
 
-    # A missing entry was dropped at the cap or expired. Skip it. Stopping
-    # at a gap would wedge the cursor permanently.
+    # Skip missing entries (dropped or expired). Stopping at a gap would
+    # wedge the cursor permanently.
     set EVENTS [list]
     for { set I [expr { $CURSOR + 1 }] } { $I <= $END } { incr I } {
         set EVENT [table lookup -subtable $sub "evt_$I"]
@@ -782,9 +761,8 @@ proc _FLUSH_EVENTS { sub } {
 
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "$sub: flushing [llength $EVENTS] event(s) to /ips/events"
 
-    # The events are deleted and the cursor advanced, so this batch is gone
-    # whatever happens next. Log any failure, or an API rejecting every POST
-    # would look identical to a healthy iApp seeing no traffic.
+    # The batch is already consumed, so a failure can only be logged. Silence
+    # here would make a rejecting API look like an iApp seeing no traffic.
     set FAILURE ""
     if { [catch {
         set BASE_URL $static::MIDEYE_SHIELD_api_base_url
@@ -1068,12 +1046,11 @@ proc _IS_API_DOWN {} {
 # Return a valid API access token, fetching a new one if needed.
 #
 # Uses a binary "token_fetching" lock to prevent concurrent refresh storms.
-# The lock is claimed with "table add", which only writes if the key is
-# absent, and ownership is decided from the return value. The sentinel is 1,
-# so if a declined add returns the existing value the two cases cannot be
-# told apart and every racing context fetches its own token. Each still ends
-# up with a valid token. A caller that does not win the lock polls until the
-# new token appears or the timeout is exhausted.
+# The lock is claimed with "table add" and ownership is decided from the
+# return value. The sentinel is 1, so if a declined add returns the existing
+# value every racing context fetches its own token, each still valid. A
+# caller that does not win polls until the new token appears or the timeout
+# is exhausted.
 #
 # Returns empty string on failure.
 # ---------------------------------------------------------------------------
@@ -1427,10 +1404,10 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
 # proc: _REPORT_BLOCK
 #
 # Buffer one "blocked" event for an IP this device refused. Fire and forget.
-# Called only after a branch's dry run check, so an event always reflects a
-# block that happened. The pending-queue-full deny does not report, because
-# that is a capacity deny of a possibly innocent IP. enforced_name says why
-# we refused (score_hard_deny or blacklist).
+# Called only after the dry run check, so an event always reflects a real
+# block. The pending-queue-full deny does not report: that is a capacity
+# deny of a possibly innocent IP. enforced_name is score_hard_deny or
+# blacklist.
 # ---------------------------------------------------------------------------
 proc _REPORT_BLOCK { client_ip enforced_name } {
     # Compared against "0" so a hand-installed iRule with the placeholder
@@ -3402,7 +3379,7 @@ if { $::hssr__mode eq "install" } {
 
 section about {
     message version "1.0.4"
-    message build_date "2026-08-14 16:27"
+    message build_date "2026-08-14 16:33"
 }
 section log {
     choice debug display "small" default "0" {
