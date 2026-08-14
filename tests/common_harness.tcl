@@ -1,8 +1,9 @@
 # =============================================================================
 # common_harness.tcl - load MIDEYE_SHIELD_COMMON.tcl procs into plain tclsh.
 #
-# TMM runs a Tcl 8.4 interpreter with no `dict`; kill it here so any accidental
-# use in the sourced procs fails loudly rather than passing on a desktop 8.6.
+# TMM runs a Tcl 8.4 interpreter with no dict command. Remove it here so any
+# accidental use in the sourced procs fails loudly instead of passing on a
+# desktop 8.6.
 # =============================================================================
 rename dict ""
 
@@ -17,7 +18,7 @@ proc when {event body} {
 
 namespace eval ::static {}
 
-# In TMM a proc is reached as `call /__partition__/RULE::PROC`; here they are
+# In TMM a proc is reached as call /__partition__/RULE::PROC. Here they are
 # plain procs, so dispatch on the name after the last colon.
 proc call {target args} {
     return [uplevel 1 [linsert $args 0 [lindex [split $target ":"] end]]]
@@ -36,13 +37,13 @@ proc clock {sub args} {
 proc advance {secs} { incr ::NOW $secs }
 
 # --- session table ----------------------------------------------------------
-# `table incr` and `table add` are atomic on a real BIG-IP; here they are simply
+# table incr and table add are atomic on a real BIG-IP. Here they are simply
 # indivisible, which is the property the buffer relies on.
 array set ::TBL     {}
 array set ::TBL_EXP {}
 
-# F5 documents that `table add` does not overwrite an existing entry, but not
-# what it hands back when it declines. The flush lock must not depend on the
+# F5 documents that table add does not overwrite an existing entry, but not
+# what it returns when it declines. The flush lock must not depend on the
 # answer, so lock tests run under both readings.
 set ::TABLE_ADD_RETURNS_EXISTING 1
 

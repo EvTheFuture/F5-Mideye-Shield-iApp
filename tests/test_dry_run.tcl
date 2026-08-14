@@ -1,6 +1,5 @@
-# COMMON's own header documents dry run as "always returns 1 but logs what would
-# have been denied". The blacklist branch did not honour it. These tests pin the
-# documented contract on every deny branch.
+# COMMON documents dry run as "always returns 1 but logs what would have been
+# denied". These tests pin that contract on every deny branch.
 source [file join [file dirname [info script]] common_harness.tcl]
 
 set ::LOGS      [list]
@@ -62,8 +61,8 @@ reset 0
 set ::SCORE 10
 assert {[_VALIDATE 1.2.3.4 300] == 1} "a low score is allowed"
 
-# Scored a hard deny too, so this fails if the whitelist branch stops taking
-# precedence rather than passing on a score that was never going to deny.
+# The score would deny on its own, so this fails if the whitelist stops
+# taking precedence.
 reset 0
 set ::WHITELIST 1
 set ::SCORE 90

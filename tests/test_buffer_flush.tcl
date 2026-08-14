@@ -1,7 +1,5 @@
 # Drive the real _ENQUEUE_EVENT / _FLUSH_EVENTS against a modelled session
 # table: batching, the two flush triggers, the overflow cap and the flush lock.
-# Every failure here costs other clients' buffered events, not just the one that
-# provoked it.
 source [file join [file dirname [info script]] common_harness.tcl]
 
 set SUB "MIDEYE_SHIELD_BLOCKS"
@@ -19,8 +17,8 @@ proc _BUILD_HSSR_ARGS {varname method uri} {
 }
 proc http_req {reqargs} {
     lappend ::POSTS $reqargs
-    # The POST is the only point a flush yields, so it is where a lock TTL can
-    # lapse and a second flusher can take over. Model that here.
+    # The POST is the only point a flush yields, so it is where a lock TTL
+    # can lapse and another flusher can take over.
     if { $::STEAL_LOCK } {
         table set -subtable $::SUB "flush_lock" "someone-else" indefinite indefinite
     }
@@ -31,8 +29,8 @@ proc LOG_WARNING {args} { lappend ::LOGS "WARNING [join $args]" }
 proc LOG_DEBUG   {args} {}
 proc LOG_INFO    {args} {}
 
-# Returns "" rather than throwing when the POST never happened, so one broken
-# expectation reports as a single failure instead of aborting the whole run.
+# Returns "" rather than throwing when the POST never happened, so a broken
+# expectation reports as one failure instead of aborting the run.
 proc post_body {i} {
     array set o [lindex $::POSTS $i]
     if { [info exists o(-body)] } { return $o(-body) }
@@ -52,8 +50,8 @@ set ::N 200
 set ::T 10
 set ::MAXBUF 1000
 
-# Seed last_flush so the timer is not already due; the cold-start case where it
-# is unset gets its own test below.
+# Seed last_flush so the timer is not already due. The cold start case has
+# its own test below.
 proc reset {{n 200} {t 10} {maxbuf 1000}} {
     array unset ::TBL
     array unset ::TBL_EXP
@@ -135,8 +133,8 @@ foreach mode {1 0} {
 }
 set ::TABLE_ADD_RETURNS_EXISTING 1
 
-# A flusher that overran its lock has been replaced; releasing then would free
-# THEIR lock and let a third run alongside them.
+# A flusher that overran its lock has been replaced. Releasing now would
+# free the new holder's lock.
 reset 1 10 1000
 set ::STEAL_LOCK 1
 enq {{"a":1}}
@@ -153,8 +151,8 @@ set ::POST_RESULT "throw"
 enq {{"a":1}}
 assert {[logged "*sideband unavailable*"] == 1} "a thrown sideband error is reported"
 
-# No token means no request to attempt, so the batch must survive: consuming it
-# anyway would lose 100% of blocked events for the length of a token outage.
+# With no token there is no request to attempt, so the batch must survive
+# the outage instead of being consumed for nothing.
 reset 1 10 1000
 set ::TOKEN ""
 enq {{"a":1}}
@@ -163,17 +161,16 @@ assert {[llength $::POSTS] == 0} "no POST is attempted without a token"
 assert {[tbl "cursor"] eq "" || [tbl "cursor"] == 0} "a missing token does not advance the cursor"
 assert {[tbl "evt_1"] eq {{"a":1}}} "a missing token leaves the event buffered for the next flush"
 
-# The token path is the one exit that leaves last_flush untouched, so the timer
-# stays due; unthrottled, every further event would cost another token request
-# on the same sideband path score lookups use.
+# The token path leaves last_flush untouched, so the timer stays due. The
+# backoff is what keeps every further event from costing a token request.
 set ::LOGS [list]
 enq {{"a":2}}
 enq {{"a":3}}
 assert {[logged "*no valid API token*"] == 0} "a token outage is not re-reported on every event"
 assert {[tbl "evt_3"] eq {{"a":3}}} "events still buffer while backed off"
 
-# Recovery has to be automatic: a backoff that outlived the outage would be
-# indistinguishable from reporting being switched off.
+# Recovery must be automatic. A backoff that never expires would look like
+# reporting switched off.
 set ::TOKEN "tok-123"
 enq {{"a":4}}
 assert {[llength $::POSTS] == 0} "the backoff still holds before it expires"
@@ -193,9 +190,8 @@ advance 31
 enq {{"a":2}}
 assert {[llength $::POSTS] == 1} "a non-numeric retry_after falls back to the default backoff"
 
-# retry_after is admin-editable, and a backoff outliving the events' TTL would
-# expire them mid-hold - lost as gaps, with no drop count and no warning. The
-# clamp is what keeps this path's loss accounting honest.
+# A backoff outliving the events' TTL would expire them mid-hold and lose
+# them as gaps, with no drop count and no warning.
 reset 1 10 1000
 set static::MIDEYE_SHIELD_api_retry_after 3600
 set ::TOKEN ""
@@ -208,8 +204,8 @@ assert {[llength $::POSTS] == 1} "a retry_after beyond the event TTL is clamped"
 assert {[post_body 0] eq {{"events":[{"a":1},{"a":2}]}}} "the clamped backoff lifts while the held event is still alive"
 
 # --- gaps -------------------------------------------------------------------
-# Stopping at a gap would wedge the cursor permanently the first time an entry
-# expired, which costs far more than the rare event lost to that race.
+# Stopping at a gap would wedge the cursor permanently the first time an
+# entry expired.
 reset 3 10 1000
 enq {{"a":1}}
 enq {{"a":2}}

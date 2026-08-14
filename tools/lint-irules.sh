@@ -2,19 +2,18 @@
 #
 # Reject Tcl constructs that TMM cannot run.
 #
-# iRules execute in TMM's embedded Tcl, which is 8.4-era: every command added in
-# Tcl 8.5+ is missing, and a desktop tclsh (8.6) runs them happily. So neither
-# `tclsh tests/` nor code review catches this class — only the BIG-IP does, at
-# iRule load time, with:
+# iRules execute in TMM's embedded Tcl, which is 8.4-era. Every command added
+# in Tcl 8.5+ is missing, and a desktop tclsh (8.6) runs them happily, so the
+# test suite cannot catch them. The BIG-IP only reports them at iRule load
+# time, after the template is already on the box:
 #
 #   01070151:3: Rule [...] error: ...: error: [undefined procedure: dict][...]
 #
-# which surfaces after deploy, when the template is already on the box. This
-# lint moves that failure to CI. It is deliberately a denylist of constructs we
-# know TMM lacks, not a Tcl parser: a false negative costs a lab round-trip, a
+# This lint moves that failure to CI. It is a denylist of constructs known to
+# be missing, not a Tcl parser. A false negative costs a lab round-trip and a
 # false positive would block a legitimate merge.
 #
-# tests/*.tcl are deliberately not linted: they run in tclsh, never on TMM, and
+# tests/*.tcl are not linted. They run in tclsh, never on TMM, and
 # legitimately use puts, source and rename.
 #
 # Usage: tools/lint-irules.sh [file ...]
@@ -25,9 +24,9 @@ set -euo pipefail
 # it has no filesystem, stdio, or event loop of its own.
 BANNED='dict|lassign|lreverse|lrepeat|apply|chan|try|throw|coroutine|yield|puts|exec|open|socket|glob|cd|pwd|vwait|update|trace|source'
 
-# A plain glob rather than `mapfile`, which macOS's bash 3.2 does not have; and
+# A plain glob rather than mapfile, which macOS's bash 3.2 does not have.
 # "$#" rather than "${#files[@]}", which is an unbound-variable error on an
-# empty array there under `set -u`.
+# empty array there under set -u.
 if [ "$#" -gt 0 ]; then
   files=("$@")
 else
@@ -37,13 +36,11 @@ fi
 status=0
 
 for f in "${files[@]}"; do
-  # Only whole-line comments are stripped. A trailing "# ..." cannot be removed
-  # safely (a # inside a string or regex is not a comment), and leaving it in
-  # only risks a false positive, which fails loud rather than silent.
-  #
-  # Command position is what makes `dict` a command rather than a word: start of
-  # line, or immediately after [ { ; or ]. That keeps prose like "predicted" and
-  # "dictionary" in comments from matching.
+  # Only whole-line comments are stripped. A trailing "# ..." cannot be
+  # removed safely because a # inside a string or regex is not a comment.
+  # Command position is what makes dict a command rather than a word: start
+  # of line, or right after [ { ; or ]. That keeps prose like "dictionary"
+  # in comments from matching.
   if hits=$(grep -nE "(^|[][{;])[[:space:]]*($BANNED)[[:space:]]" "$f" \
             | grep -vE '^[0-9]+:[[:space:]]*#' ); then
     echo "::error file=$f::TMM cannot run these Tcl constructs (8.5+ or unsupported in iRules):"
@@ -53,7 +50,7 @@ for f in "${files[@]}"; do
 
   # {*} argument expansion is 8.5 syntax, not a command, so it needs its own check.
   if hits=$(grep -nE '\{\*\}' "$f" | grep -vE '^[0-9]+:[[:space:]]*#'); then
-    echo "::error file=$f::{*} argument expansion is Tcl 8.5 syntax; TMM cannot parse it:"
+    echo "::error file=$f::{*} argument expansion is Tcl 8.5 syntax and TMM cannot parse it:"
     echo "$hits" | sed 's/^/  /'
     status=1
   fi

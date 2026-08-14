@@ -1,6 +1,6 @@
-# What actually reaches /ips/events when the BIG-IP refuses a connection, and -
-# just as important - which denials must never produce an event. No innocent IP
-# may be reported as blocked when it wasn't.
+# What reaches /ips/events when the BIG-IP refuses a connection, and which
+# denials must never produce an event. No innocent IP may be reported as
+# blocked.
 source [file join [file dirname [info script]] common_harness.tcl]
 
 set SUB "MIDEYE_SHIELD_BLOCKS"
@@ -19,8 +19,7 @@ proc class {op value cmp dg} {
 }
 proc _FETCH_IP_SCORE {client_ip cache_time} { return $::SCORE }
 
-# Capture what would be buffered instead of exercising the buffer again; Task 2
-# already covers batching and flushing.
+# Capture what would be buffered. Batching and flushing have their own tests.
 set ::ENQUEUED [list]
 proc _ENQUEUE_EVENT {sub event_json batch_size flush_interval max_buffer} {
     lappend ::ENQUEUED [list $sub $event_json]
@@ -32,9 +31,8 @@ set static::MIDEYE_SHIELD_block_batch_size     200
 set static::MIDEYE_SHIELD_block_flush_interval 10
 set static::MIDEYE_SHIELD_block_max_buffer     1000
 
-# Every flag a test flips has to be restored here. A "reports nothing" assertion
-# passes for free under disabled or block_enabled 0, so leaving either set would
-# make every negative below vacuous.
+# Every flag a test flips is restored here. A leaked disabled or
+# block_enabled 0 would make every "reports nothing" assertion pass for free.
 proc reset {{dry 0}} {
     array unset ::TBL
     array unset ::TBL_EXP
@@ -72,8 +70,7 @@ assert {[llength $::ENQUEUED] == 1} "a blacklist deny enqueues exactly one event
 assert {[string match {*"name":"blacklist"*} [evt 0]]} "blacklist deny is named apart from a score deny"
 
 # --- what must NEVER be reported --------------------------------------------
-# A full pending queue is a capacity deny of a possibly-innocent IP, fired
-# exactly when the device is already overloaded.
+# A full pending queue is a capacity deny of a possibly innocent IP.
 reset
 set ::SCORE -3
 _VALIDATE 1.2.3.4 300
@@ -99,8 +96,8 @@ set ::SCORE 10
 _VALIDATE 1.2.3.4 300
 assert {[llength $::ENQUEUED] == 0} "an allowed IP reports nothing"
 
-# Scored a hard deny too, so this fails if the whitelist branch stops taking
-# precedence rather than passing on a score that was never going to deny.
+# The score would deny on its own, so this fails if the whitelist stops
+# taking precedence.
 reset
 set ::WHITELIST 1
 set ::SCORE 90
@@ -120,8 +117,8 @@ _VALIDATE 1.2.3.4 300
 assert {[llength $::ENQUEUED] == 0} "reporting turned off reports nothing"
 
 # --- enforcedBy.id fallback -------------------------------------------------
-# enforcedBy.id is required and min_length 1; an empty virtual name would make
-# the whole batch POST fail validation.
+# enforcedBy.id is required and non-empty in the API schema. An empty virtual
+# name would fail validation for the whole batch.
 reset
 set ::VIRTUAL_NAME ""
 set ::SCORE 90
@@ -129,9 +126,9 @@ _VALIDATE 1.2.3.4 300
 assert {[string match {*"id":"mideye_shield"*} [evt 0]]} "enforcedBy.id falls back when virtual name is empty"
 
 # --- the builder must actually escape what it interpolates ------------------
-# Testing _JSON_ESCAPE in isolation says nothing about whether the event builder
-# calls it, and one raw byte fails validation for the whole batch. Hostile bytes
-# are built with format %c so this file stays free of literal backslashes.
+# _JSON_ESCAPE in isolation says nothing about whether the event builder
+# calls it. Hostile bytes are built with format %c to keep literal
+# backslashes out of this file.
 reset
 set Q [format %c 34]
 set B [format %c 92]

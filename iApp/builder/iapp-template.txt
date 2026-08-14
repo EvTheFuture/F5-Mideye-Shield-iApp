@@ -26,21 +26,18 @@ sys application template /Common/MIDEYE_SHIELD {
                 bundled helper. The helper virtual server uses SNAT automap, is
                 disabled on all VLANs (sideband only), and uses the Server SSL
                 profile you select.</p>
-                <p>Blocked-connection reporting: when enabled, the iApp reports every
-                connection it blocks on reputation grounds - a blacklist match, or a
-                score at or above the hard deny threshold - to the Shield API, so
-                blocks made on your behalf are visible there and count towards an
-                IP's reputation. Connections refused for any other reason are not
+                <p>Blocked-connection reporting: when enabled, the iApp reports
+                every connection it blocks on reputation grounds (a blacklist
+                match, or a score at or above the hard deny threshold) to the
+                Shield API, so blocks made on your behalf count towards an IP's
+                reputation. Connections refused for any other reason are not
                 reported, and nothing is reported while Dry Run Mode is on. One
-                event is reported per refused TCP connection, so a single browser
-                may produce several.
-                Reports are not sent one at a time; they are buffered and sent as a
-                single request per batch. A batch goes out once N events have been
-                buffered, or at most T seconds after the previous batch, whichever
-                comes first. If the buffer reaches its maximum - because the API is
-                unreachable, or because blocks arrive faster than they can be sent -
-                further events are dropped rather than queued without limit, and a
-                warning is logged saying how many. Dropping reports never affects
+                event is reported per refused TCP connection, so a single
+                browser may produce several. Events are buffered and sent in
+                batches. A batch goes out once N events are buffered, or T
+                seconds after the previous batch, whichever comes first. If the
+                buffer fills faster than it can be sent, further events are
+                dropped and a warning is logged. Dropped reports never affect
                 whether a connection is blocked.</p>
             }
             implementation {

@@ -1,6 +1,5 @@
-# A single byte that is not valid UTF-8 makes the whole batch POST unparseable,
-# dropping up to 1000 buffered events from other clients. Escaping is not
-# cosmetic here.
+# A single byte of invalid UTF-8 makes the whole batch POST unparseable,
+# dropping up to 1000 buffered events from other clients.
 source [file join [file dirname [info script]] common_harness.tcl]
 
 assert {[_JSON_ESCAPE {plain}] eq {plain}} "plain string is unchanged"
