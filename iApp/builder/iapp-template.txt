@@ -26,6 +26,17 @@ sys application template /Common/MIDEYE_SHIELD {
                 bundled helper. The helper virtual server uses SNAT automap, is
                 disabled on all VLANs (sideband only), and uses the Server SSL
                 profile you select.</p>
+                <p>Blocked-connection reporting: when enabled, the iApp reports every
+                connection it refuses to the Shield API, so blocks made on your
+                behalf are visible there and count towards an IP's reputation.
+                Reports are not sent one at a time; they are buffered and sent as a
+                single request per batch. A batch goes out once N events have been
+                buffered, or at most T seconds after the previous batch, whichever
+                comes first. If the buffer reaches its maximum - because the API is
+                unreachable, or because blocks arrive faster than they can be sent -
+                further events are dropped rather than queued without limit, and a
+                warning is logged saying how many. Dropping reports never affects
+                whether a connection is blocked.</p>
             }
             implementation {
 

@@ -322,6 +322,18 @@
             "label": "Blocked-connection reporting",
             "fields": [
                 {
+                    "name": "block_enabled",
+                    "field": "enabled",
+                    "label": "Report Blocked Connections to Shield",
+                    "type": "choice",
+                    "display": "small",
+                    "default": "1",
+                    "choices": [
+                        {"value": "1", "label": "Yes"},
+                        {"value": "0", "label": "No"}
+                    ]
+                },
+                {
                     "name": "block_batch_size",
                     "field": "batch_size",
                     "label": "Flush after this many buffered blocked events (N)",

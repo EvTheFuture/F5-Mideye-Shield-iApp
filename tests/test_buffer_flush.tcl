@@ -152,11 +152,15 @@ set ::POST_RESULT "throw"
 enq {{"a":1}}
 assert {[logged "*sideband unavailable*"] == 1} "a thrown sideband error is reported"
 
+# No token means no request to attempt, so the batch must survive: consuming it
+# anyway would lose 100% of blocked events for the length of a token outage.
 reset 1 10 1000
 set ::TOKEN ""
 enq {{"a":1}}
 assert {[logged "*no valid API token*"] == 1} "a missing token is reported"
 assert {[llength $::POSTS] == 0} "no POST is attempted without a token"
+assert {[tbl "cursor"] eq "" || [tbl "cursor"] == 0} "a missing token does not advance the cursor"
+assert {[tbl "evt_1"] eq {{"a":1}}} "a missing token leaves the event buffered for the next flush"
 
 # --- gaps -------------------------------------------------------------------
 # Stopping at a gap would wedge the cursor permanently the first time an entry

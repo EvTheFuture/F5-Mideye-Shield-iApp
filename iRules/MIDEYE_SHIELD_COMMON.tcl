@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.16
+# Version : 0.9.17
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-06-10
+# Date    : 2026-08-14
 #
 # Purpose
 # -------
@@ -34,13 +34,17 @@
 # Procs are called from other iRules using the full iRule path syntax:
 #   call /__partition__/MIDEYE_SHIELD_COMMON::<PROCNAME> <args>
 #
-# The session subtable name is hardcoded as the constant string "MIDEYE_SHIELD"
-# in every proc rather than held in a variable.
+# The statistics, cache and token procs hardcode the subtable name
+# "MIDEYE_SHIELD" rather than holding it in a variable. The event buffer procs
+# take their subtable as a parameter instead, so each caller owns an
+# independent buffer.
 #
 # The token_fetching sentinel uses "table add" (-excl semantics) rather than
-# incr, because it is a binary lock, not a counter. "table add" only writes
-# if the key does not already exist, and returns the existing value if it does.
-# This gives a single atomic test-and-set with no read-modify-write gap.
+# incr, because it is a binary lock, not a counter. "table add" only writes if
+# the key does not already exist, which gives a single atomic test-and-set with
+# no read-modify-write gap. What it hands back when it declines is not specified
+# firmly enough to bet on, so a lock whose holder must be identified exactly -
+# the event flush lock - claims a unique ticket and reads the key back instead.
 #
 #
 # Session Variables
@@ -143,8 +147,10 @@
 #
 # Dependencies - Session Table (subtable)
 # ----------------------------------------
-# All table keys live in the subtable "MIDEYE_SHIELD" to avoid collisions.
-# Key naming conventions used internally:
+# Statistics, cache and token keys live in the subtable "MIDEYE_SHIELD"; the
+# blocked-event buffer keeps its own subtable, "MIDEYE_SHIELD_BLOCKS", so a
+# flood of one kind of key cannot evict the other's. Key naming conventions
+# used internally in "MIDEYE_SHIELD":
 #
 #   score_<ip>            - Cached score for an IP (-1 = under investigation)
 #   pending_<ip>          - Number of connections waiting for this IP's score
@@ -161,6 +167,16 @@
 #   stat_allowed_apifail  - Counter: connections allowed due to API failure
 #   stat_allowed_score    - Counter: connections allowed due to acceptable score
 #   stat_blocked          - Counter: connections blocked
+#
+# And in "MIDEYE_SHIELD_BLOCKS", written only by the event buffer procs:
+#
+#   seq                   - Sequence number of the last event enqueued
+#   cursor                - Sequence number of the last event flushed
+#   evt_<n>               - Buffered event body (JSON), keyed by sequence number
+#   flush_lock            - Ticket of the flusher currently holding the lock
+#   ticket                - Counter handing out unique flush-lock tickets
+#   last_flush            - Epoch seconds of the last completed flush
+#   dropped               - Counter: events discarded since the last flush
 #
 # =============================================================================
 
@@ -216,6 +232,7 @@ when RULE_INIT {
 
     # Blocked-event reporting buffer. Separate from any other buffer so one
     # flood cannot evict the other's events.
+    set static::MIDEYE_SHIELD_block_enabled        "__block__enabled__"
     set static::MIDEYE_SHIELD_block_batch_size     "__block__batch_size__"
     set static::MIDEYE_SHIELD_block_flush_interval "__block__flush_interval__"
     set static::MIDEYE_SHIELD_block_max_buffer     "__block__max_buffer__"
@@ -301,6 +318,10 @@ proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
     # advances in _FLUSH_EVENTS, so skipping the trigger leaves nothing that can
     # ever bring the buffer back under the cap.
     if { $buffered > $MAXBUF } {
+        # Seeded like seq and ticket: created by incr alone it inherits the
+        # subtable's default timeout and can expire between infrequent flushes,
+        # undercounting exactly when the buffer is in trouble.
+        table add -subtable $sub "dropped" 0 indefinite indefinite
         table incr -subtable $sub "dropped"
     } else {
         table set -subtable $sub "evt_$seq" $event_json $TTL $TTL
@@ -331,10 +352,16 @@ proc _RELEASE_FLUSH_LOCK { sub tok } {
 # proc: _FLUSH_EVENTS
 #
 # Gather up to 1000 buffered events (the Shield API per-request cap) into one
-# {"events":[...]} body and POST it once over HSSR. A ticket lock serialises
-# flushers device-wide. Fire-and-forget: a failed POST drops that batch rather
-# than retrying, keeping the buffer bounded - but it says so out loud, because
-# by then the events are gone.
+# {"events":[...]} body and POST it once over HSSR.
+#
+# A ticket lock serialises flushers within one TMM, not device-wide: the session
+# table is per-TMM, so an N-TMM box holds N independent buffers and can have N
+# flushes in flight at once, and the real ceiling is max_buffer * N.
+#
+# Fire-and-forget: a failed POST drops that batch rather than retrying, keeping
+# the buffer bounded - but it says so out loud, because by then the events are
+# gone. A flush with no API token is the one exception: it gives up before
+# consuming anything, so the batch outlives the outage.
 # ---------------------------------------------------------------------------
 proc _FLUSH_EVENTS { sub } {
     set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
@@ -359,6 +386,23 @@ proc _FLUSH_EVENTS { sub } {
     # holder sees its own ticket, whatever add returned.
     table add -subtable $sub "flush_lock" $tok $LOCK_TTL $LOCK_TTL
     if { [table lookup -subtable $sub "flush_lock"] ne $tok } {
+        return
+    }
+
+    # Fetched before the batch is consumed. Everything below destroys the events
+    # whatever happens next, so a token outage must not reach it: with no token
+    # there is no request to attempt, and burning the buffer for nothing loses
+    # 100% of blocks for the whole outage. Leave the cursor, the events,
+    # last_flush and dropped untouched and let the next flush try again.
+    set TOKEN ""
+    if { [catch { set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN] } token_err] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: token lookup failed -> $token_err"
+        set TOKEN ""
+    }
+
+    if { $TOKEN eq "" } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: no valid API token, keeping buffered event(s) for the next flush"
+        call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $tok
         return
     }
 
@@ -412,20 +456,15 @@ proc _FLUSH_EVENTS { sub } {
     # indistinguishable from a healthy iApp seeing no traffic.
     set failure ""
     if { [catch {
-        set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
-        if { $TOKEN eq "" } {
-            set failure "no valid API token"
-        } else {
-            set BASE_URL $static::MIDEYE_SHIELD_api_base_url
-            call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}/ips/events"
-            lappend ARGS \
-                -headers [list "Authorization" "Bearer ${TOKEN}"] \
-                -body    $BODY \
-                -type    "application/json"
-            set STATUS [call __hssr_irule__::http_req $ARGS]
-            if { $STATUS ne "" && ![string match "2*" $STATUS] } {
-                set failure "HTTP $STATUS"
-            }
+        set BASE_URL $static::MIDEYE_SHIELD_api_base_url
+        call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}/ips/events"
+        lappend ARGS \
+            -headers [list "Authorization" "Bearer ${TOKEN}"] \
+            -body    $BODY \
+            -type    "application/json"
+        set STATUS [call __hssr_irule__::http_req $ARGS]
+        if { $STATUS ne "" && ![string match "2*" $STATUS] } {
+            set failure "HTTP $STATUS"
         }
     } err] } {
         set failure $err
@@ -1063,26 +1102,37 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
 # enforced_name distinguishes why we refused (score_hard_deny / blacklist).
 # ---------------------------------------------------------------------------
 proc _REPORT_BLOCK { client_ip enforced_name } {
-    set VS ""
-    catch { set VS [virtual name] }
+    # Compared against "0" rather than "1" so an iRule installed by hand, with
+    # the placeholder unsubstituted, still reports.
+    if { $static::MIDEYE_SHIELD_block_enabled == "0" } { return }
 
-    # enforcedBy.id is required and min_length 1 in the API schema; an empty id
-    # would fail validation for the whole batch, not just this event.
-    if { $VS eq "" } { set VS "mideye_shield" }
+    # Reporting a block must never change what happens to the connection: an
+    # uncaught throw here would abort the caller's iRule event, mid-policy on
+    # the APM path.
+    if { [catch {
+        set VS ""
+        catch { set VS [virtual name] }
 
-    set TS [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]
+        # enforcedBy.id is required and min_length 1 in the API schema; an empty
+        # id would fail validation for the whole batch, not just this event.
+        if { $VS eq "" } { set VS "mideye_shield" }
 
-    set J "\{\"ipAddress\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $client_ip]\""
-    append J ",\"observedAt\":\"$TS\""
-    append J ",\"authentication\":\{\"outcome\":\"blocked\""
-    append J ",\"enforcedBy\":\{\"id\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $VS]\""
-    append J ",\"name\":\"$enforced_name\""
-    append J ",\"type\":\"irule\",\"provider\":\"f5_bigip\"\}\}\}"
+        set TS [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]
 
-    call /__partition__/MIDEYE_SHIELD_COMMON::_ENQUEUE_EVENT "MIDEYE_SHIELD_BLOCKS" $J \
-        $static::MIDEYE_SHIELD_block_batch_size \
-        $static::MIDEYE_SHIELD_block_flush_interval \
-        $static::MIDEYE_SHIELD_block_max_buffer
+        set J "\{\"ipAddress\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $client_ip]\""
+        append J ",\"observedAt\":\"$TS\""
+        append J ",\"authentication\":\{\"outcome\":\"blocked\""
+        append J ",\"enforcedBy\":\{\"id\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $VS]\""
+        append J ",\"name\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $enforced_name]\""
+        append J ",\"type\":\"irule\",\"provider\":\"f5_bigip\"\}\}\}"
+
+        call /__partition__/MIDEYE_SHIELD_COMMON::_ENQUEUE_EVENT "MIDEYE_SHIELD_BLOCKS" $J \
+            $static::MIDEYE_SHIELD_block_batch_size \
+            $static::MIDEYE_SHIELD_block_flush_interval \
+            $static::MIDEYE_SHIELD_block_max_buffer
+    } err] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Something went wrong reporting a block for '$client_ip': '$err'"
+    }
 }
 
 # ---------------------------------------------------------------------------

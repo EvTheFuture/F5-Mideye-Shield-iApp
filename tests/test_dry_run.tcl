@@ -62,8 +62,11 @@ reset 0
 set ::SCORE 10
 assert {[_VALIDATE 1.2.3.4 300] == 1} "a low score is allowed"
 
+# Scored a hard deny too, so this fails if the whitelist branch stops taking
+# precedence rather than passing on a score that was never going to deny.
 reset 0
 set ::WHITELIST 1
+set ::SCORE 90
 assert {[_VALIDATE 1.2.3.4 300] == 1} "a whitelisted IP is allowed"
 
 finish

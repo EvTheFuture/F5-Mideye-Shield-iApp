@@ -14,6 +14,9 @@
 # know TMM lacks, not a Tcl parser: a false negative costs a lab round-trip, a
 # false positive would block a legitimate merge.
 #
+# tests/*.tcl are deliberately not linted: they run in tclsh, never on TMM, and
+# legitimately use puts, source and rename.
+#
 # Usage: tools/lint-irules.sh [file ...]
 #        (defaults to every iRule the template embeds: iRules/ and HSSR/)
 set -euo pipefail
