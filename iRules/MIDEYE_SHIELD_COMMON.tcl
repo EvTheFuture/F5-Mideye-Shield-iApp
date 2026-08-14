@@ -214,6 +214,12 @@ when RULE_INIT {
     # Hashing
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
 
+    # Blocked-event reporting buffer. Separate from any other buffer so one
+    # flood cannot evict the other's events.
+    set static::MIDEYE_SHIELD_block_batch_size     "__block__batch_size__"
+    set static::MIDEYE_SHIELD_block_flush_interval "__block__flush_interval__"
+    set static::MIDEYE_SHIELD_block_max_buffer     "__block__max_buffer__"
+
     # Escape map for JSON string values, built once here rather than per call.
     #
     # Every byte outside printable ASCII is escaped, not just the C0 controls: a
@@ -1046,6 +1052,40 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
 }
 
 # ---------------------------------------------------------------------------
+# proc: _REPORT_BLOCK
+#
+# Buffer one "blocked" event for an IP the BIG-IP refused. Fire-and-forget.
+#
+# Only ever called after a branch's dry-run check, so an event can only follow a
+# block that actually happened. The pending-queue-full deny deliberately does
+# not call this: that is a capacity deny of a possibly-innocent IP.
+#
+# enforced_name distinguishes why we refused (score_hard_deny / blacklist).
+# ---------------------------------------------------------------------------
+proc _REPORT_BLOCK { client_ip enforced_name } {
+    set VS ""
+    catch { set VS [virtual name] }
+
+    # enforcedBy.id is required and min_length 1 in the API schema; an empty id
+    # would fail validation for the whole batch, not just this event.
+    if { $VS eq "" } { set VS "mideye_shield" }
+
+    set TS [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]
+
+    set J "\{\"ipAddress\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $client_ip]\""
+    append J ",\"observedAt\":\"$TS\""
+    append J ",\"authentication\":\{\"outcome\":\"blocked\""
+    append J ",\"enforcedBy\":\{\"id\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $VS]\""
+    append J ",\"name\":\"$enforced_name\""
+    append J ",\"type\":\"irule\",\"provider\":\"f5_bigip\"\}\}\}"
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::_ENQUEUE_EVENT "MIDEYE_SHIELD_BLOCKS" $J \
+        $static::MIDEYE_SHIELD_block_batch_size \
+        $static::MIDEYE_SHIELD_block_flush_interval \
+        $static::MIDEYE_SHIELD_block_max_buffer
+}
+
+# ---------------------------------------------------------------------------
 # proc: _VALIDATE
 #
 # Internal shared validation logic used by VALIDATE_CONNECTION and
@@ -1087,6 +1127,7 @@ proc _VALIDATE { client_ip cache_time } {
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 2 (Blacklisted)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::_REPORT_BLOCK $client_ip "blacklist"
         return 0
     }
 
@@ -1134,6 +1175,7 @@ proc _VALIDATE { client_ip cache_time } {
         }
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "DENY '$client_ip' due to too high score '$SCORE'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::_REPORT_BLOCK $client_ip "score_hard_deny"
         return 0
     }
 
