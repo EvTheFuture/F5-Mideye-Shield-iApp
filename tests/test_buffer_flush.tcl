@@ -193,6 +193,20 @@ advance 31
 enq {{"a":2}}
 assert {[llength $::POSTS] == 1} "a non-numeric retry_after falls back to the default backoff"
 
+# retry_after is admin-editable, and a backoff outliving the events' TTL would
+# expire them mid-hold - lost as gaps, with no drop count and no warning. The
+# clamp is what keeps this path's loss accounting honest.
+reset 1 10 1000
+set static::MIDEYE_SHIELD_api_retry_after 3600
+set ::TOKEN ""
+enq {{"a":1}}
+set static::MIDEYE_SHIELD_api_retry_after 30
+set ::TOKEN "tok-123"
+advance 61
+enq {{"a":2}}
+assert {[llength $::POSTS] == 1} "a retry_after beyond the event TTL is clamped"
+assert {[post_body 0] eq {{"events":[{"a":1},{"a":2}]}}} "the clamped backoff lifts while the held event is still alive"
+
 # --- gaps -------------------------------------------------------------------
 # Stopping at a gap would wedge the cursor permanently the first time an entry
 # expired, which costs far more than the rare event lost to that race.

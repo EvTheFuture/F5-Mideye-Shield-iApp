@@ -1,6 +1,6 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.18
+# Version : 0.9.19
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-08-14
 #
@@ -364,11 +364,13 @@ proc _RELEASE_FLUSH_LOCK { sub tok } {
 # consuming anything, so the batch outlives the outage.
 # ---------------------------------------------------------------------------
 proc _FLUSH_EVENTS { sub } {
-    # Set only by the token-outage path below, which is the one exit that leaves
-    # last_flush untouched: without this gate the timer stays permanently due
-    # and every buffered event costs another doomed token request. Those share
-    # the sideband path with score lookups, so an outage would degrade the
-    # blocking itself - a reporting failure must not reach that far.
+    # Set only by the token-outage path below, which returns with last_flush
+    # unwritten and no other flusher about to write it, so the timer stays
+    # permanently due. (The lock-contention exit skips last_flush too, but its
+    # holder writes it.) _GET_VALID_TOKEN has no negative cache, so ungated
+    # every blocked connection would pay a fresh token fetch - up to a full
+    # api_timeout inside CLIENT_ACCEPTED before its reject landed. A reporting
+    # failure must not delay the block it is reporting.
     if { [table lookup -subtable $sub "backoff"] ne "" } { return }
 
     set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
@@ -412,6 +414,13 @@ proc _FLUSH_EVENTS { sub } {
 
         # Free-text iApp field, as with the buffer settings above.
         if { ![string is integer -strict $RETRY] || $RETRY < 1 } { set RETRY 30 }
+
+        # Buffered events carry a TTL of flush_interval * 2 + 60, so never less
+        # than 62s. Holding longer than that would expire them mid-backoff, and
+        # an expired event is indistinguishable from a gap: skipped silently,
+        # with no drop count and no warning. Every other loss on this path is
+        # counted and logged, and this one must not be the exception.
+        if { $RETRY > 60 } { set RETRY 60 }
 
         # Deliberately not _MARK_API_DOWN: that is the score path's breaker, and
         # failing to report must never make the iApp stop scoring. The backoff
