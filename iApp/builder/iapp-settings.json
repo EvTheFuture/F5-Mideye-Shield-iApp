@@ -316,6 +316,39 @@
                     "default": ""
                 }
             ]
+        },
+        {
+            "id": "block",
+            "label": "Blocked-connection reporting",
+            "fields": [
+                {
+                    "name": "block_batch_size",
+                    "field": "batch_size",
+                    "label": "Flush after this many buffered blocked events (N)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "200"
+                },
+                {
+                    "name": "block_flush_interval",
+                    "field": "flush_interval",
+                    "label": "Flush at least this often, seconds (T)",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "10"
+                },
+                {
+                    "name": "block_max_buffer",
+                    "field": "max_buffer",
+                    "label": "Maximum buffered blocked events before dropping",
+                    "type": "string",
+                    "required": true,
+                    "display": "small",
+                    "default": "1000"
+                }
+            ]
         }
     ]
 }

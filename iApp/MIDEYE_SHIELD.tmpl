@@ -1,6 +1,6 @@
 #TMSH-VERSION: 17.5.1.5
-# IAPP_VERSION: 1.0.3
-# IAPP_BUILD_DATE: 2026-06-10 16:04
+# IAPP_VERSION: 1.0.4
+# IAPP_BUILD_DATE: 2026-08-14 11:22
 
 cli admin-partitions {
     update-partition Common
@@ -221,6 +221,9 @@ set _SUBST_MAP [list "__log__debug__" "$::log__debug" \
     "__pending__poll_interval__" "$::pending__poll_interval" \
     "__infra__dns__" "$::infra__dns" \
     "__hash__username_salt__" "$::hash__username_salt" \
+    "__block__batch_size__" "$::block__batch_size" \
+    "__block__flush_interval__" "$::block__flush_interval" \
+    "__block__max_buffer__" "$::block__max_buffer" \
     "__partition__" "$_partition" \
     "__base_partition__" "$_base_partition" \
     "__hssr_irule__" "$_hssr_irule" \
@@ -238,7 +241,7 @@ set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
 # Version : 0.9.5
-# iApp Version : 1.0.3
+# iApp Version : 1.0.4
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-06-10
 #
@@ -319,7 +322,7 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
 # Version : 0.9.16
-# iApp Version : 1.0.3
+# iApp Version : 1.0.4
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-06-10
 #
@@ -532,11 +535,230 @@ when RULE_INIT {
 
     # Hashing
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
+
+    # Blocked-event reporting buffer. Separate from any other buffer so one
+    # flood cannot evict the other's events.
+    set static::MIDEYE_SHIELD_block_batch_size     "__block__batch_size__"
+    set static::MIDEYE_SHIELD_block_flush_interval "__block__flush_interval__"
+    set static::MIDEYE_SHIELD_block_max_buffer     "__block__max_buffer__"
+
+    # Escape map for JSON string values, built once here rather than per call.
+    #
+    # Every byte outside printable ASCII is escaped, not just the C0 controls: a
+    # single byte that is not valid UTF-8 makes the whole batch POST unparseable,
+    # dropping every other event buffered with it. \u00xx keeps the byte value
+    # and is always valid JSON.
+    #
+    # Not an iApp setting: the generator's cross-check only matches statics whose
+    # value is a double-quoted string, so this list is invisible to it.
+    set static::MIDEYE_SHIELD_json_map [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t \b \\b \f \\f]
+    for { set c 0 } { $c < 256 } { incr c } {
+        if { $c >= 0x20 && $c < 0x7f } { continue }
+        if { $c == 8 || $c == 9 || $c == 10 || $c == 12 || $c == 13 } { continue }
+        lappend static::MIDEYE_SHIELD_json_map \
+            [format %c $c] [format {\u%04x} $c]
+    }
 }
 
 # ===========================================================================
 # P R I V A T E   P R O C E D U R E S
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# proc: _JSON_ESCAPE
+#
+# Escape a string for inclusion in a JSON double-quoted value, using the map
+# built in RULE_INIT (see there for why non-ASCII is escaped too).
+# ---------------------------------------------------------------------------
+proc _JSON_ESCAPE { s } {
+    return [string map $static::MIDEYE_SHIELD_json_map $s]
+}
+
+# ---------------------------------------------------------------------------
+# proc: _ENQUEUE_EVENT
+#
+# Append one event (JSON string) to the buffer in subtable "sub". Drops the
+# event (fail-open, counted) when the buffer is at capacity. Triggers a flush
+# when the buffer reaches batch_size OR flush_interval has elapsed since the
+# last flush (the time trigger fires on the next event after T - a truly idle
+# buffer self-expires via the per-event TTL).
+#
+# Sizing arrives as arguments rather than statics so each caller owns its own
+# buffer settings and its own subtable.
+# ---------------------------------------------------------------------------
+proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
+    set N      $batch_size
+    set T      $flush_interval
+    set MAXBUF $max_buffer
+
+    # These come from free-text iApp fields. Tcl compares a non-numeric operand
+    # as a string rather than failing, so a typo like "1,000" would quietly make
+    # every comparison below meaningless; fall back to the defaults instead of
+    # reporting nothing at all.
+    if { ![string is integer -strict $N]      || $N < 1 }      { set N 200 }
+    if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
+    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 1000 }
+
+    # A batch size above the cap can never be reached: events are dropped at the
+    # cap long before the batch fills, leaving the timer as the only trigger.
+    if { $N > $MAXBUF } { set N $MAXBUF }
+
+    # An event has to outlive the interval it is waiting for. Deriving the TTL
+    # from T rather than fixing it means raising the flush interval cannot
+    # silently expire the very buffer that interval exists to accumulate.
+    set TTL [expr { $T * 2 + 60 }]
+
+    # Seed with `table add` rather than pinning after the fact: `table incr`
+    # then `table set ... 1` loses an increment when two callers race at cold
+    # start, and two events then claim the same sequence number.
+    table add -subtable $sub "seq" 0 indefinite indefinite
+    set seq [table incr -subtable $sub "seq"]
+
+    set cursor [table lookup -subtable $sub "cursor"]
+    if { $cursor eq "" } { set cursor 0 }
+    set buffered [expr { $seq - $cursor }]
+
+    # Over capacity: drop this event, but still fall through to the flush
+    # trigger below. Returning here would be terminal - the cursor only ever
+    # advances in _FLUSH_EVENTS, so skipping the trigger leaves nothing that can
+    # ever bring the buffer back under the cap.
+    if { $buffered > $MAXBUF } {
+        table incr -subtable $sub "dropped"
+    } else {
+        table set -subtable $sub "evt_$seq" $event_json $TTL $TTL
+    }
+
+    set last [table lookup -subtable $sub "last_flush"]
+    if { $last eq "" } { set last 0 }
+
+    if { $buffered >= $N || ([clock seconds] - $last) >= $T } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_EVENTS $sub
+    }
+}
+
+# ---------------------------------------------------------------------------
+# proc: _RELEASE_FLUSH_LOCK
+#
+# Release the flush lock only if we still hold it. A flush that overran its lock
+# TTL has already been replaced by another flusher; deleting the entry then
+# would free THEIR lock and let a third run alongside them.
+# ---------------------------------------------------------------------------
+proc _RELEASE_FLUSH_LOCK { sub tok } {
+    if { [table lookup -subtable $sub "flush_lock"] eq $tok } {
+        table delete -subtable $sub "flush_lock"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# proc: _FLUSH_EVENTS
+#
+# Gather up to 1000 buffered events (the Shield API per-request cap) into one
+# {"events":[...]} body and POST it once over HSSR. A ticket lock serialises
+# flushers device-wide. Fire-and-forget: a failed POST drops that batch rather
+# than retrying, keeping the buffer bounded - but it says so out loud, because
+# by then the events are gone.
+# ---------------------------------------------------------------------------
+proc _FLUSH_EVENTS { sub } {
+    set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
+
+    # From a free-text iApp field. A non-numeric value would throw out of the
+    # expr below, which sits outside this proc's catch, aborting the caller's
+    # iRule event - fail-closed, in a fail-open feature.
+    if { ![string is integer -strict $TIMEOUT] || $TIMEOUT < 1 } { set TIMEOUT 2500 }
+
+    set LOCK_TTL [expr { int($TIMEOUT / 1000) + 5 }]
+
+    # Cold-start race: `table incr` then `table set ... 1` loses an increment
+    # when two flushers arrive together, and a duplicated ticket lets both hold
+    # the lock at once and POST the same events twice. Seeding with `table add`
+    # establishes the indefinite lifetime before any increment.
+    table add -subtable $sub "ticket" 0 indefinite indefinite
+    set tok [table incr -subtable $sub "ticket"]
+
+    # `table add` will not overwrite an existing entry, but what it returns is
+    # not specified firmly enough to bet a lock on - in either direction. Claim
+    # a ticket no other flusher can hold, then read the lock back: only the
+    # holder sees its own ticket, whatever add returned.
+    table add -subtable $sub "flush_lock" $tok $LOCK_TTL $LOCK_TTL
+    if { [table lookup -subtable $sub "flush_lock"] ne $tok } {
+        return
+    }
+
+    set cursor [table lookup -subtable $sub "cursor"]
+    if { $cursor eq "" } { set cursor 0 }
+    set seq [table lookup -subtable $sub "seq"]
+    if { $seq eq "" } { set seq 0 }
+
+    set end $seq
+    if { [expr { $end - $cursor }] > 1000 } {
+        set end [expr { $cursor + 1000 }]
+    }
+
+    # A missing entry is either an event dropped at the cap or one whose sequence
+    # number is already claimed but whose body has not landed yet; from here the
+    # two look identical. Both are skipped rather than waited for - stopping at a
+    # gap would wedge the cursor permanently the first time an entry expired.
+    set events [list]
+    for { set s [expr { $cursor + 1 }] } { $s <= $end } { incr s } {
+        set j [table lookup -subtable $sub "evt_$s"]
+        if { $j ne "" } {
+            lappend events $j
+            table delete -subtable $sub "evt_$s"
+        }
+    }
+
+    table set -subtable $sub "cursor" $end indefinite indefinite
+    table set -subtable $sub "last_flush" [clock seconds] indefinite indefinite
+
+    # Report overflow here rather than leaving it in a table key nothing reads.
+    # Once per flush is rate-limited by construction, and a buffer that is
+    # dropping events is the one thing an operator needs to be told.
+    set dropped [table lookup -subtable $sub "dropped"]
+    if { $dropped ne "" && $dropped > 0 } {
+        table delete -subtable $sub "dropped"
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: buffer full, dropped $dropped event(s) since the last flush"
+    }
+
+    if { [llength $events] == 0 } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $tok
+        return
+    }
+
+    set BODY "\{\"events\":\[[join $events ,]\]\}"
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "$sub: flushing [llength $events] event(s) to /ips/events"
+
+    # The events are already deleted and the cursor already advanced, so this
+    # batch is gone whatever happens next. Anything that goes wrong has to be
+    # said out loud: a Shield API that rejects every POST is otherwise
+    # indistinguishable from a healthy iApp seeing no traffic.
+    set failure ""
+    if { [catch {
+        set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
+        if { $TOKEN eq "" } {
+            set failure "no valid API token"
+        } else {
+            set BASE_URL $static::MIDEYE_SHIELD_api_base_url
+            call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}/ips/events"
+            lappend ARGS \
+                -headers [list "Authorization" "Bearer ${TOKEN}"] \
+                -body    $BODY \
+                -type    "application/json"
+            set STATUS [call __hssr_irule__::http_req $ARGS]
+            if { $STATUS ne "" && ![string match "2*" $STATUS] } {
+                set failure "HTTP $STATUS"
+            }
+        }
+    } err] } {
+        set failure $err
+    }
+
+    if { $failure ne "" } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: dropped [llength $events] event(s) -> $failure"
+    }
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $tok
+}
 
 # ---------------------------------------------------------------------------
 # proc:_LOG_COMMON
@@ -1152,6 +1374,40 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
 }
 
 # ---------------------------------------------------------------------------
+# proc: _REPORT_BLOCK
+#
+# Buffer one "blocked" event for an IP the BIG-IP refused. Fire-and-forget.
+#
+# Only ever called after a branch's dry-run check, so an event can only follow a
+# block that actually happened. The pending-queue-full deny deliberately does
+# not call this: that is a capacity deny of a possibly-innocent IP.
+#
+# enforced_name distinguishes why we refused (score_hard_deny / blacklist).
+# ---------------------------------------------------------------------------
+proc _REPORT_BLOCK { client_ip enforced_name } {
+    set VS ""
+    catch { set VS [virtual name] }
+
+    # enforcedBy.id is required and min_length 1 in the API schema; an empty id
+    # would fail validation for the whole batch, not just this event.
+    if { $VS eq "" } { set VS "mideye_shield" }
+
+    set TS [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]
+
+    set J "\{\"ipAddress\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $client_ip]\""
+    append J ",\"observedAt\":\"$TS\""
+    append J ",\"authentication\":\{\"outcome\":\"blocked\""
+    append J ",\"enforcedBy\":\{\"id\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $VS]\""
+    append J ",\"name\":\"$enforced_name\""
+    append J ",\"type\":\"irule\",\"provider\":\"f5_bigip\"\}\}\}"
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::_ENQUEUE_EVENT "MIDEYE_SHIELD_BLOCKS" $J \
+        $static::MIDEYE_SHIELD_block_batch_size \
+        $static::MIDEYE_SHIELD_block_flush_interval \
+        $static::MIDEYE_SHIELD_block_max_buffer
+}
+
+# ---------------------------------------------------------------------------
 # proc: _VALIDATE
 #
 # Internal shared validation logic used by VALIDATE_CONNECTION and
@@ -1184,8 +1440,16 @@ proc _VALIDATE { client_ip cache_time } {
     if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_BLACKLIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
 
+        # The counter is incremented above the dry-run check, as on the score
+        # branch, so dry run still counts what it would have denied.
+        if {$DRY_RUN == "1"} {
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied '$client_ip' due to blacklist match"
+            return 1
+        }
+
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 2 (Blacklisted)"
+        call /__partition__/MIDEYE_SHIELD_COMMON::_REPORT_BLOCK $client_ip "blacklist"
         return 0
     }
 
@@ -1233,6 +1497,7 @@ proc _VALIDATE { client_ip cache_time } {
         }
 
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "DENY '$client_ip' due to too high score '$SCORE'"
+        call /__partition__/MIDEYE_SHIELD_COMMON::_REPORT_BLOCK $client_ip "score_hard_deny"
         return 0
     }
 
@@ -1522,7 +1787,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 1.0.3
+# iApp Version : 1.0.4
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -3080,8 +3345,8 @@ if { $::hssr__mode eq "install" } {
             presentation {
 
 section about {
-    message version "1.0.3"
-    message build_date "2026-06-10 16:04"
+    message version "1.0.4"
+    message build_date "2026-08-14 11:22"
 }
 section log {
     choice debug display "small" default "0" {
@@ -3156,6 +3421,11 @@ section hssr {
 section hash {
     string username_salt display "xlarge" default ""
 }
+section block {
+    string batch_size required display "small" default "200"
+    string flush_interval required display "small" default "10"
+    string max_buffer required display "small" default "1000"
+}
 
 text {
     about                     "About"
@@ -3196,6 +3466,10 @@ text {
     hssr.ssl_profile          "Server SSL Profile for the helper VS"
     hash                      "Username Hashing"
     hash.username_salt        "Username Salt (leave empty to auto-generate)"
+    block                     "Blocked-connection reporting"
+    block.batch_size          "Flush after this many buffered blocked events (N)"
+    block.flush_interval      "Flush at least this often, seconds (T)"
+    block.max_buffer          "Maximum buffered blocked events before dropping"
 }
 
             }
