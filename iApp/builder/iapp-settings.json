@@ -339,8 +339,9 @@
                     "label": "Flush after this many buffered blocked events (N)",
                     "type": "string",
                     "required": true,
+                    "validator": "NonNegativeNumber",
                     "display": "small",
-                    "default": "200"
+                    "default": "1000"
                 },
                 {
                     "name": "block_flush_interval",
@@ -348,6 +349,7 @@
                     "label": "Flush at least this often, seconds (T)",
                     "type": "string",
                     "required": true,
+                    "validator": "NonNegativeNumber",
                     "display": "small",
                     "default": "10"
                 },
@@ -357,8 +359,65 @@
                     "label": "Maximum buffered blocked events before dropping",
                     "type": "string",
                     "required": true,
+                    "validator": "NonNegativeNumber",
+                    "display": "small",
+                    "default": "5000"
+                }
+            ]
+        },
+        {
+            "id": "traffic",
+            "label": "Traffic Intelligence (client fingerprinting)",
+            "fields": [
+                {
+                    "name": "traffic_enabled",
+                    "field": "enabled",
+                    "label": "Report client fingerprints for all traffic",
+                    "type": "choice",
+                    "display": "small",
+                    "default": "1",
+                    "choices": [
+                        {"value": "1", "label": "Yes"},
+                        {"value": "0", "label": "No"}
+                    ]
+                },
+                {
+                    "name": "traffic_batch_size",
+                    "field": "batch_size",
+                    "label": "Flush after this many buffered events (N)",
+                    "type": "string",
+                    "required": true,
+                    "validator": "NonNegativeNumber",
                     "display": "small",
                     "default": "1000"
+                },
+                {
+                    "name": "traffic_flush_interval",
+                    "field": "flush_interval",
+                    "label": "Flush at least this often, seconds (T)",
+                    "type": "string",
+                    "required": true,
+                    "validator": "NonNegativeNumber",
+                    "display": "small",
+                    "default": "10"
+                },
+                {
+                    "name": "traffic_max_buffer",
+                    "field": "max_buffer",
+                    "label": "Max buffered events before dropping (fail-open cap)",
+                    "type": "string",
+                    "required": true,
+                    "validator": "NonNegativeNumber",
+                    "display": "small",
+                    "default": "5000"
+                },
+                {
+                    "name": "traffic_sensor_id",
+                    "field": "sensor_id",
+                    "label": "Sensor id reported as the event source (leave empty to use this device's hostname)",
+                    "type": "string",
+                    "display": "large",
+                    "default": ""
                 }
             ]
         }
