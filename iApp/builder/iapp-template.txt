@@ -1,4 +1,4 @@
-#TMSH-VERSION: 14.0.0
+#TMSH-VERSION: 17.1.0
 
 cli admin-partitions {
     update-partition Common
@@ -8,9 +8,13 @@ sys application template /Common/MIDEYE_SHIELD {
         definition {
             html-help {
                 <p>Mideye Shield iApp template. Configure the settings below to deploy
-                the three Mideye Shield iRules (MIDEYE_SHIELD_COMMON, MIDEYE_SHIELD_APM,
-                MIDEYE_SHIELD_CONNECTION) together with the supporting data groups
-                (MIDEYE_SHIELD_WHITELIST, MIDEYE_SHIELD_BLACKLIST).</p>
+                the four Mideye Shield iRules (MIDEYE_SHIELD_COMMON, MIDEYE_SHIELD_APM,
+                MIDEYE_SHIELD_CONNECTION, MIDEYE_SHIELD_TRAFFIC) together with the
+                supporting data groups (MIDEYE_SHIELD_WHITELIST,
+                MIDEYE_SHIELD_BLACKLIST).</p>
+                <p>Deploying the template creates the iRules; it does not attach them
+                to anything. Each one takes effect on the Virtual Servers you apply
+                it to.</p>
                 <p>On first deployment the whitelist is populated with RFC1918 defaults
                 and the blacklist is created empty. On upgrade, both lists are
                 preserved as-is so any administrator edits survive.</p>
@@ -39,6 +43,29 @@ sys application template /Common/MIDEYE_SHIELD {
                 buffer fills faster than it can be sent, further events are
                 dropped and a warning is logged. Dropped reports never affect
                 whether a connection is blocked.</p>
+                <p>Traffic Intelligence: on by default, and active on any Virtual
+                Server you apply the MIDEYE_SHIELD_TRAFFIC iRule to. It reports a
+                TLS and HTTP client fingerprint for every connection there, not
+                only for authentication attempts. What leaves the device is the
+                JA3 and JA4 fingerprints, the request method, the destination
+                host and the path without its query string, and the header names
+                in the order the client sent them. Header values are not
+                reported, apart from Host, Accept-Language and User-Agent, and
+                Authorization, Cookie and similar credential headers are not
+                reported at all. Events are buffered and sent in batches on the
+                same terms as blocked-connection reporting. A buffered event
+                can reach 8 kB, so the buffer cap is a memory figure as much
+                as an event count: the default 5000 reserves at most 40 MB on
+                every TMM, though ordinary traffic averages nearer 500 bytes an
+                event than the 8 kB ceiling. Reporting never
+                changes whether a connection is served, and a failed report is
+                logged and dropped. Batches are sent as connections close, so
+                requests do not wait for the send. Apply the iRule after
+                MIDEYE_SHIELD_CONNECTION when both are on the same Virtual
+                Server, and only where the client speaks first, such as TLS
+                or HTTP: capturing the handshake holds the server-side
+                connection back until the client sends, which would hang a
+                protocol whose server greets first, such as SSH or SMTP.</p>
             }
             implementation {
 
@@ -102,6 +129,16 @@ if { [_MIDEYE_SHIELD_dg_missing /$partition/MIDEYE_SHIELD_BLACKLIST] } {
 }
 
 # ---------------------------------------------------------------------------
+# Internal substitution setup
+#
+# Compute the values of internal placeholder substitutions (e.g. partition
+# name from tmsh::pwd) before the substitution map is built. Each TCL
+# variable defined here is referenced by an entry in _SUBST_MAP below.
+# Also defines _escape_answer / _unescape_answer, used from here on.
+# ---------------------------------------------------------------------------
+__IAPP_INTERNAL_SETUP__
+
+# ---------------------------------------------------------------------------
 # Username salt
 #
 # Generate a random salt if the administrator did not supply one. The salt
@@ -117,7 +154,15 @@ if { $::hash__username_salt eq "" } {
         # so the rule lives in the iApp folder. tmsh::get_config will find
         # it by short name when run inside the iApp implementation context.
         set _existing_rule [tmsh::get_config /ltm rule MIDEYE_SHIELD_COMMON]
-        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt    ;# Trailing " to keep an even number of unescaped double quotes on this line, so tmsh's outer parser does not lose track of string state when reading the iApp implementation block.
+
+        # The salt is the last thing on its line, so a greedy match to the
+        # final quote needs no view of how the value itself is escaped.
+        regexp -line {^\s*set static::MIDEYE_SHIELD_username_salt\s+"(.*)"\s*$} $_existing_rule -> _existing_salt
+
+        # What the iRule holds is escaped for its double-quoted string. Undo
+        # that, or _escape_answer escapes it again on the way back in and the
+        # salt silently changes, invalidating every username hashed under it.
+        set _existing_salt [_unescape_answer $_existing_salt]
     }
 
     if { $_existing_salt ne "" } {
@@ -134,15 +179,6 @@ if { $::hash__username_salt eq "" } {
         set ::hash__username_salt $_salt
     }
 }
-
-# ---------------------------------------------------------------------------
-# Internal substitution setup
-#
-# Compute the values of internal placeholder substitutions (e.g. partition
-# name from tmsh::pwd) before the substitution map is built. Each TCL
-# variable defined here is referenced by an entry in _SUBST_MAP below.
-# ---------------------------------------------------------------------------
-__IAPP_INTERNAL_SETUP__
 
 # ---------------------------------------------------------------------------
 # Build placeholder substitution map
@@ -190,7 +226,7 @@ __IAPP_TEXT__
     description "Mideye Shield - IP reputation and login validation"
     ignore-verification false
     requires-bigip-version-max none
-    requires-bigip-version-min 14.1
+    requires-bigip-version-min 17.1
     requires-modules { ltm }
     signing-key none
     tmpl-checksum none

@@ -157,6 +157,29 @@ INTERNAL_SUBSTITUTIONS = [
         ],
     },
     {
+        "placeholder": "__device_hostname__",
+        "tcl_var": "_device_hostname",
+        "setup_code": [
+            "# Default sensor id. Each unit of an HA pair resolves its own hostname:",
+            "# the sensor is the box that saw the request, not the cluster. Guarded,",
+            "# because an optional telemetry label must never fail a deployment.",
+            "set _device_hostname \"\"",
+            "if { [catch {",
+            "    set _gs [lindex [tmsh::get_config /sys global-settings] 0]",
+            "    set _device_hostname [tmsh::get_field_value $_gs hostname]",
+            "}] } {",
+            "    set _device_hostname \"\"",
+            "}",
+            "if { $_device_hostname eq \"\" } {",
+            "    # A warning, not a failure: the TRAFFIC iRule falls back to its",
+            "    # runtime hostname. It must not be silent, though - and neither",
+            "    # way of saying so may be what fails the deployment instead.",
+            "    catch { puts \"MIDEYE_SHIELD: device hostname unresolved; traffic source id falls back to the runtime hostname\" }",
+            "    catch { tmsh::log \"MIDEYE_SHIELD iApp: device hostname unresolved at deploy time\" }",
+            "}",
+        ],
+    },
+    {
         "placeholder": "__hssr_helper_vs__",
         "tcl_var": "_hssr_helper_vs",
         "setup_code": [
@@ -913,9 +936,12 @@ def build_subst_map_entries(setting_entries):
         placeholder = f'__{entry["section_id"]}__{entry["field_id"]}__'
         iapp_var = f'$::{entry["section_id"]}__{entry["field_id"]}'
 
-        parts.append(f'"{placeholder}" "{iapp_var}"')
+        parts.append(f'"{placeholder}" "[_escape_answer {iapp_var}]"')
 
-    # Then internal substitutions (partition, hssr_irule alias, etc.)
+    # Then internal substitutions. Not escaped: they come from tmsh config
+    # rather than a text box, and some land in bare words like
+    # `call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG`, where a backslash
+    # would be part of the name.
     for entry in INTERNAL_SUBSTITUTIONS:
         placeholder = entry["placeholder"]
         tcl_ref = f'${entry["tcl_var"]}'
@@ -927,10 +953,40 @@ def build_subst_map_entries(setting_entries):
 
 
 def build_internal_setup_code():
-    # Build the block of TCL code that computes each internal substitution's
-    # value before the iRule substitution runs. Emitted into the
-    # implementation block at the __IAPP_INTERNAL_SETUP__ marker.
-    lines = []
+    # Build the block of TCL code that runs before the iRule substitution.
+    # Emitted into the implementation block at the __IAPP_INTERNAL_SETUP__
+    # marker: the answer escaper, then each internal substitution's value.
+    #
+    # Codes 92 34 36 91 93 are \ " $ [ ] - everything that ends a double-quoted
+    # TCL string or is evaluated inside one. They are built with [format %c]
+    # rather than written as backslash escapes because a literal \[ inside a
+    # [...] substitution breaks TCL's bracket matching, and a proc body is not
+    # parsed until it is called: that failure lands mid-deployment, not here.
+    # tests/test_answer_escaping.tcl calls both procs out of the built template.
+    lines = [
+        "# Every answer from the form lands in a double-quoted TCL string inside",
+        "# an iRule body. Escape what would end that string or be evaluated in it,",
+        "# or a quote in any text field fails the iRule load mid-deployment.",
+        "proc _escape_answer { value } {",
+        "    set bs [format %c 92]",
+        "    set map [list]",
+        "    foreach code {92 34 36 91 93} {",
+        "        lappend map [format %c $code] $bs[format %c $code]",
+        "    }",
+        "    return [string map $map $value]",
+        "}",
+        "",
+        "# The inverse, for reading an answer back out of a deployed iRule.",
+        "proc _unescape_answer { value } {",
+        "    set bs [format %c 92]",
+        "    set map [list]",
+        "    foreach code {92 34 36 91 93} {",
+        "        lappend map $bs[format %c $code] [format %c $code]",
+        "    }",
+        "    return [string map $map $value]",
+        "}",
+        "",
+    ]
 
     for entry in INTERNAL_SUBSTITUTIONS:
         lines.extend(entry["setup_code"])

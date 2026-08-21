@@ -1,0 +1,87 @@
+name: Validate iApp template
+
+# Lint the iRules for constructs TMM cannot run, run the Tcl tests, check that
+# those tests can fail, then regenerate MIDEYE_SHIELD.tmpl and fail if the
+# committed one is stale. The build-date stamp is ignored in the comparison.
+on:
+  pull_request:
+    paths:
+      - "iRules/**"
+      - "HSSR/**"
+      - "iApp/builder/**"
+      - "iApp/MIDEYE_SHIELD.tmpl"
+      - "Makefile"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/validate-template.yml"
+  push:
+    branches: [master]
+    paths:
+      - "iRules/**"
+      - "HSSR/**"
+      - "iApp/builder/**"
+      - "iApp/MIDEYE_SHIELD.tmpl"
+      - "Makefile"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/validate-template.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      # First: tclsh is 8.6 and runs Tcl 8.5+ happily, so nothing below catches
+      # a construct TMM cannot parse.
+      - name: Lint iRules for TMM-incompatible Tcl
+        run: bash tools/lint-irules.sh
+
+      - name: Install tclsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tcl
+
+      - name: Run Tcl tests
+        run: make test
+
+      # An assertion that cannot fail passes just as greenly as one that can.
+      - name: Check the tests can fail
+        run: make mutate
+
+      - name: Regenerate template and check it is up to date
+        run: |
+          set -euo pipefail
+          TMPL="iApp/MIDEYE_SHIELD.tmpl"
+          if [ ! -f "${TMPL}" ]; then
+            echo "::error::${TMPL} is missing - the generated template must be committed."; exit 1
+          fi
+          CUR="$(sed -n 's/^# IAPP_VERSION:[[:space:]]*//p' "${TMPL}" | head -1)"
+          if [ -z "${CUR}" ]; then
+            echo "::error::Could not read IAPP_VERSION from ${TMPL}"; exit 1
+          fi
+          echo "Committed template version: ${CUR}"
+
+          COMMITTED="$(mktemp)"
+          cp "${TMPL}" "${COMMITTED}"
+
+          # Regenerate in place at the SAME version (make writes to ${TMPL}); the generator's
+          # own structure validation fails the build on unbalanced braces / uncovered statics.
+          make VERSION="${CUR}"
+
+          # Compare, neutralising only the volatile build-date stamp (minute granularity).
+          norm() { sed -E 's/^# IAPP_BUILD_DATE:.*/# IAPP_BUILD_DATE:/; s/(message build_date ")[^"]*(")/\1\2/' "$1"; }
+          if ! diff <(norm "${COMMITTED}") <(norm "${TMPL}"); then
+            echo "::error::${TMPL} is out of date with its sources. Run 'make' locally and commit the regenerated template."
+            exit 1
+          fi
+          echo "Template is up to date. ✔"

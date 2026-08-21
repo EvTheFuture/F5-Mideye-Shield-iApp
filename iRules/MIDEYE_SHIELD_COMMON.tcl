@@ -1,8 +1,8 @@
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.18
+# Version : 0.9.19
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-08-14
+# Date    : 2026-08-17
 #
 # Purpose
 # -------
@@ -146,10 +146,10 @@
 #
 # Dependencies - Session Table (subtable)
 # ----------------------------------------
-# Statistics, cache and token keys live in the subtable "MIDEYE_SHIELD".
-# The blocked-event buffer keeps its own subtable "MIDEYE_SHIELD_BLOCKS" so
-# neither can evict the other's keys. Key naming conventions used internally
-# in "MIDEYE_SHIELD":
+# Statistics, cache and token keys live in the subtable "MIDEYE_SHIELD". Each
+# event buffer owns a separate one - "MIDEYE_SHIELD_BLOCKS" and
+# "MIDEYE_SHIELD_TRAFFIC" - so no buffer can evict another's keys. Key naming
+# conventions used internally in "MIDEYE_SHIELD":
 #
 #   score_<ip>            - Cached score for an IP (-1 = under investigation)
 #   pending_<ip>          - Number of connections waiting for this IP's score
@@ -167,7 +167,7 @@
 #   stat_allowed_score    - Counter: connections allowed due to acceptable score
 #   stat_blocked          - Counter: connections blocked
 #
-# And in "MIDEYE_SHIELD_BLOCKS", written only by the event buffer procs:
+# And in each buffer's subtable, written only by the event buffer procs:
 #
 #   seq                   - Sequence number of the last event enqueued
 #   cursor                - Sequence number of the last event flushed
@@ -236,6 +236,21 @@ when RULE_INIT {
     set static::MIDEYE_SHIELD_block_flush_interval   "__block__flush_interval__"
     set static::MIDEYE_SHIELD_block_max_buffer       "__block__max_buffer__"
 
+    # Byte bound on one POST body, shared by both buffers. The batch settings
+    # count events, never their size, so a full batch of large events reaches
+    # 7.8 MB. Sized to clear the 1 MB body limit an ingress commonly defaults
+    # to, which answers 413 without the batch surviving to be retried.
+    set static::MIDEYE_SHIELD_max_batch_bytes        921600
+
+    # Client-fingerprint reporting
+    set static::MIDEYE_SHIELD_traffic_enabled        "__traffic__enabled__"
+    set static::MIDEYE_SHIELD_traffic_batch_size     "__traffic__batch_size__"
+    set static::MIDEYE_SHIELD_traffic_flush_interval "__traffic__flush_interval__"
+    set static::MIDEYE_SHIELD_traffic_max_buffer     "__traffic__max_buffer__"
+    set static::MIDEYE_SHIELD_traffic_sensor_id      "__traffic__sensor_id__"
+    # Not a form field; the iApp resolves it at deploy time.
+    set static::MIDEYE_SHIELD_traffic_device_hostname "__device_hostname__"
+
     # Escape map for JSON string values. Every byte outside printable ASCII
     # is escaped because one byte of invalid UTF-8 makes an entire batch
     # POST unparseable. The generator's cross-check ignores this static.
@@ -263,27 +278,25 @@ proc _JSON_ESCAPE { value } {
 }
 
 # ---------------------------------------------------------------------------
-# proc: _ENQUEUE_EVENT
+# proc: _BUFFER_EVENT
 #
-# Append one event (a JSON object string) to the buffer in subtable "sub"
-# and flush once batch_size events are buffered or flush_interval has passed
-# since the last flush. There is no timer, the time trigger fires on the
-# next event. When the buffer is full the event is dropped and counted.
-# Sizing comes as arguments so each caller owns its own buffer.
+# Append one event (a JSON object string) to the buffer in subtable "sub".
+# When the buffer is full the event is dropped and counted. Sizing comes as
+# arguments so each caller owns its own buffer.
+#
+# Returns 1 when a deferring caller must stop deferring. Call through
+# _ENQUEUE_EVENT or _ENQUEUE_EVENT_DEFERRED, not directly.
 # ---------------------------------------------------------------------------
-proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
+proc _BUFFER_EVENT { sub event_json batch_size flush_interval max_buffer } {
     set N      $batch_size
     set T      $flush_interval
     set MAXBUF $max_buffer
 
     # The sizes come from free-text iApp fields. Fall back to the defaults
     # rather than let Tcl compare non-numbers as strings.
-    if { ![string is integer -strict $N]      || $N < 1 }      { set N 200 }
+    if { ![string is integer -strict $N]      || $N < 1 }      { set N 1000 }
     if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
-    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 1000 }
-
-    # A batch size above the buffer cap could never be reached.
-    if { $N > $MAXBUF } { set N $MAXBUF }
+    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 5000 }
 
     # An event must outlive the interval it is waiting for.
     set TTL [expr { $T * 2 + 60 }]
@@ -305,6 +318,84 @@ proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
     } else {
         table set -subtable $sub "evt_$SEQ" $event_json $TTL $TTL
     }
+
+    # Stop deferring on a backlog: twice the batch size, leaving a deferring
+    # caller room to pass it and wait for a close, and never past half the cap,
+    # which a raised cap would put out of reach.
+    set BACKSTOP [expr { $N * 2 }]
+    set HALF     [expr { $MAXBUF / 2 }]
+    if { $BACKSTOP > $HALF } { set BACKSTOP $HALF }
+    if { $BUFFERED >= $BACKSTOP } { return 1 }
+
+    # And on silence: a whole interval with no flush leaves events to expire in
+    # the buffer, unsent and counted as no drop.
+    set LAST [table lookup -subtable $sub "last_flush"]
+    if { $LAST eq "" } { return 1 }
+
+    return [expr { ([clock seconds] - $LAST) >= $T }]
+}
+
+# ---------------------------------------------------------------------------
+# proc: _ENQUEUE_EVENT
+#
+# Buffer one event and POST the batch if it is due. There is no timer, so the
+# time trigger fires on the next event rather than on its own.
+# ---------------------------------------------------------------------------
+proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
+    call /__partition__/MIDEYE_SHIELD_COMMON::_BUFFER_EVENT $sub $event_json \
+        $batch_size $flush_interval $max_buffer
+
+    call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_IF_DUE $sub \
+        $batch_size $flush_interval $max_buffer
+}
+
+# ---------------------------------------------------------------------------
+# proc: _ENQUEUE_EVENT_DEFERRED
+#
+# Buffer one event and leave the POST to the caller's CLIENT_CLOSED, which
+# keeps the synchronous sideband wait off a request. Deferring stops when the
+# close path falls behind - see the two triggers in _BUFFER_EVENT - and that
+# costs what _ENQUEUE_EVENT has always cost.
+# ---------------------------------------------------------------------------
+proc _ENQUEUE_EVENT_DEFERRED { sub event_json batch_size flush_interval max_buffer } {
+    if { [call /__partition__/MIDEYE_SHIELD_COMMON::_BUFFER_EVENT $sub $event_json \
+            $batch_size $flush_interval $max_buffer] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_IF_DUE $sub \
+            $batch_size $flush_interval $max_buffer
+    }
+}
+
+# ---------------------------------------------------------------------------
+# proc: _FLUSH_IF_DUE
+#
+# Flush the buffer in subtable "sub" if it has reached batch_size events or
+# flush_interval has passed since the last flush.
+#
+# The only definition of "due", so the inline and deferred paths cannot drift
+# apart. Reads only the session table, which outlives the connection: the known
+# TMM defects here are an iRule resuming into a flow that is already gone.
+# ---------------------------------------------------------------------------
+proc _FLUSH_IF_DUE { sub batch_size flush_interval max_buffer } {
+    set N      $batch_size
+    set T      $flush_interval
+    set MAXBUF $max_buffer
+
+    if { ![string is integer -strict $N]      || $N < 1 }      { set N 1000 }
+    if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
+    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 5000 }
+
+    # A batch size above the buffer cap could never be reached.
+    if { $N > $MAXBUF } { set N $MAXBUF }
+
+    set CURSOR [table lookup -subtable $sub "cursor"]
+    if { $CURSOR eq "" } { set CURSOR 0 }
+    set SEQ [table lookup -subtable $sub "seq"]
+    if { $SEQ eq "" } { set SEQ 0 }
+
+    # The common case for a closing connection that reported nothing, so leave
+    # before doing any more work.
+    set BUFFERED [expr { $SEQ - $CURSOR }]
+    if { $BUFFERED < 1 } { return }
 
     set LAST [table lookup -subtable $sub "last_flush"]
     if { $LAST eq "" } { set LAST 0 }
@@ -330,9 +421,10 @@ proc _RELEASE_FLUSH_LOCK { sub ticket } {
 # ---------------------------------------------------------------------------
 # proc: _FLUSH_EVENTS
 #
-# Collect up to 1000 buffered events (the Shield API per request cap) into
-# one {"events":[...]} body and POST it once over HSSR. A ticket lock
-# serialises flushers within one TMM (the session table is per TMM).
+# Collect buffered events into one {"events":[...]} body and POST it once over
+# HSSR, stopping at 1000 events (the Shield API per request cap) or
+# max_batch_bytes, whichever comes first. A ticket lock serialises flushers
+# within one TMM (the session table is per TMM).
 #
 # Fire and forget: a failed POST drops the batch and logs a warning. The
 # exception is a missing API token, which keeps the batch and backs off.
@@ -395,18 +487,39 @@ proc _FLUSH_EVENTS { sub } {
         set END [expr { $CURSOR + 1000 }]
     }
 
+    set MAXBYTES $static::MIDEYE_SHIELD_max_batch_bytes
+
+    # A non-numeric value would throw below and abort the caller's event.
+    if { ![string is integer -strict $MAXBYTES] || $MAXBYTES < 1 } { set MAXBYTES 921600 }
+
     # Skip missing entries (dropped or expired). Stopping at a gap would
     # wedge the cursor permanently.
+    #
+    # Stop early once the body would outgrow MAXBYTES. What is left keeps its
+    # place for the next flush, so the cursor tracks what was taken rather than
+    # what was offered: advancing it to END here would strand the remainder,
+    # unsent and counted as no drop.
     set EVENTS [list]
+    set BYTES  0
+    set TAKEN  $CURSOR
     for { set I [expr { $CURSOR + 1 }] } { $I <= $END } { incr I } {
         set EVENT [table lookup -subtable $sub "evt_$I"]
         if { $EVENT ne "" } {
+            # This event plus the comma the join puts before it.
+            set SIZE [expr { [string length $EVENT] + 1 }]
+
+            # One event over the cap on its own still goes, or it would block
+            # the cursor behind it for as long as it lives.
+            if { [llength $EVENTS] > 0 && [expr { $BYTES + $SIZE }] > $MAXBYTES } { break }
+
             lappend EVENTS $EVENT
+            incr BYTES $SIZE
             table delete -subtable $sub "evt_$I"
         }
+        set TAKEN $I
     }
 
-    table set -subtable $sub "cursor" $END indefinite indefinite
+    table set -subtable $sub "cursor" $TAKEN indefinite indefinite
     table set -subtable $sub "last_flush" [clock seconds] indefinite indefinite
 
     # Report drops here so the warning is rate limited to once per flush.
