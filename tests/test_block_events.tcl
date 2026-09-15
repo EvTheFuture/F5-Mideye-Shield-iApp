@@ -21,8 +21,14 @@ proc _FETCH_IP_SCORE {client_ip cache_time} { return $::SCORE }
 
 # Capture what would be buffered. Batching and flushing have their own tests.
 set ::ENQUEUED [list]
+set ::DEFERRED [list]
 proc _ENQUEUE_EVENT {sub event_json batch_size flush_interval max_buffer} {
     lappend ::ENQUEUED [list $sub $event_json]
+}
+# Enforcement must not take the deferred path: there is no close event in
+# these iRules to perform the flush, so a batch would sit until the backstop.
+proc _ENQUEUE_EVENT_DEFERRED {sub event_json batch_size flush_interval max_buffer} {
+    lappend ::DEFERRED [list $sub $event_json]
 }
 
 set static::MIDEYE_SHIELD_score_hard_deny      80
@@ -137,5 +143,10 @@ set ::SCORE 90
 _VALIDATE 1.2.3.4 300
 set want "${Q}id${Q}:${Q}/Common/vs${B}${Q}${B}${B}x${Q}"
 assert {[string first $want [evt 0]] >= 0} "the event builder escapes quotes and backslashes it interpolates"
+
+# Traffic reporting defers its flush to CLIENT_CLOSED. Enforcement cannot:
+# these iRules have no close event to perform it, so a deferred batch would
+# sit until the backstop caught it.
+assert {[llength $::DEFERRED] == 0} "block reporting flushes inline, it does not defer"
 
 finish
