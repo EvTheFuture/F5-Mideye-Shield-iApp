@@ -1,6 +1,6 @@
-#TMSH-VERSION: 14.0.0
-# IAPP_VERSION: 1.0.4
-# IAPP_BUILD_DATE: 2026-08-14 16:33
+#TMSH-VERSION: 17.1.0
+# IAPP_VERSION: 1.0.5
+# IAPP_BUILD_DATE: 2026-09-15 11:41
 
 cli admin-partitions {
     update-partition Common
@@ -10,9 +10,13 @@ sys application template /Common/MIDEYE_SHIELD {
         definition {
             html-help {
                 <p>Mideye Shield iApp template. Configure the settings below to deploy
-                the three Mideye Shield iRules (MIDEYE_SHIELD_COMMON, MIDEYE_SHIELD_APM,
-                MIDEYE_SHIELD_CONNECTION) together with the supporting data groups
-                (MIDEYE_SHIELD_WHITELIST, MIDEYE_SHIELD_BLACKLIST).</p>
+                the four Mideye Shield iRules (MIDEYE_SHIELD_COMMON, MIDEYE_SHIELD_APM,
+                MIDEYE_SHIELD_CONNECTION, MIDEYE_SHIELD_TRAFFIC) together with the
+                supporting data groups (MIDEYE_SHIELD_WHITELIST,
+                MIDEYE_SHIELD_BLACKLIST).</p>
+                <p>Deploying the template creates the iRules; it does not attach them
+                to anything. Each one takes effect on the Virtual Servers you apply
+                it to.</p>
                 <p>On first deployment the whitelist is populated with RFC1918 defaults
                 and the blacklist is created empty. On upgrade, both lists are
                 preserved as-is so any administrator edits survive.</p>
@@ -41,6 +45,42 @@ sys application template /Common/MIDEYE_SHIELD {
                 buffer fills faster than it can be sent, further events are
                 dropped and a warning is logged. Dropped reports never affect
                 whether a connection is blocked.</p>
+                <p>Traffic Intelligence: on by default, and active on any Virtual
+                Server you apply the MIDEYE_SHIELD_TRAFFIC iRule to. It reports a
+                TLS and HTTP client fingerprint for every connection there, not
+                only for authentication attempts.</p>
+                <ul>
+                <li><b>What leaves the device:</b> the JA3 and JA4 fingerprints,
+                the request method, the destination host, the path without its
+                query string, and the header names in the order the client sent
+                them.</li>
+                <li><b>Header values</b> are reported only for Host,
+                Accept-Language and User-Agent. Cookie is reported by name only:
+                its presence is a fingerprint ingredient and its value is never
+                read. Authorization, Set-Cookie and similar credential headers
+                are not reported at all, not even by name.</li>
+                <li><b>Where to apply it:</b> only where the client speaks
+                first, such as TLS or HTTP. Capturing the handshake holds the
+                server-side connection back until the client sends, which would
+                hang a protocol whose server greets first, such as SSH or SMTP.
+                An HTTP profile is required: a TLS Virtual Server without one
+                collects the handshake but reports nothing.</li>
+                <li><b>Ordering:</b> apply it after MIDEYE_SHIELD_CONNECTION
+                when both are on the same Virtual Server, so the enforcement
+                decision completes first.</li>
+                <li><b>Batching:</b> events are buffered and sent in batches on
+                the same terms as blocked-connection reporting. On a busy
+                Virtual Server the batch is sent as a connection closes, so
+                requests do not wait for it. Where requests arrive further apart
+                than the flush interval, the request itself sends the batch.</li>
+                <li><b>Buffer cap:</b> a buffered event can reach 8 kB, so the
+                cap is a memory figure as much as an event count, though
+                ordinary traffic averages nearer 500 bytes an event. This
+                iRule's buffer lives on a single TMM, so the default 5000
+                reserves at most 40 MB on that one TMM.</li>
+                <li><b>Failure:</b> reporting never changes whether a connection
+                is served. A failed report is logged and dropped.</li>
+                </ul>
             }
             implementation {
 
@@ -104,46 +144,35 @@ if { [_MIDEYE_SHIELD_dg_missing /$partition/MIDEYE_SHIELD_BLACKLIST] } {
 }
 
 # ---------------------------------------------------------------------------
-# Username salt
-#
-# Generate a random salt if the administrator did not supply one. The salt
-# is read back from the running config on re-deploy so the value persists.
-# ---------------------------------------------------------------------------
-if { $::hash__username_salt eq "" } {
-    # Pull existing salt from the current iRule (if any) to avoid regenerating
-    # on every re-deploy, which would invalidate all previously hashed users.
-    set _existing_salt ""
-
-    catch {
-        # Mark-and-sweep converts tmsh::create to tmsh::modify on re-deploy,
-        # so the rule lives in the iApp folder. tmsh::get_config will find
-        # it by short name when run inside the iApp implementation context.
-        set _existing_rule [tmsh::get_config /ltm rule MIDEYE_SHIELD_COMMON]
-        regexp {static::MIDEYE_SHIELD_username_salt\s+"([^"]*)"} $_existing_rule -> _existing_salt    ;# Trailing " to keep an even number of unescaped double quotes on this line, so tmsh's outer parser does not lose track of string state when reading the iApp implementation block.
-    }
-
-    if { $_existing_salt ne "" } {
-        set ::hash__username_salt $_existing_salt
-    } else {
-        # Generate a fresh 32-character random salt
-        set _chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        set _salt ""
-
-        for { set _i 0 } { $_i < 32 } { incr _i } {
-            append _salt [string index $_chars [expr { int(rand() * [string length $_chars]) }]]
-        }
-
-        set ::hash__username_salt $_salt
-    }
-}
-
-# ---------------------------------------------------------------------------
 # Internal substitution setup
 #
 # Compute the values of internal placeholder substitutions (e.g. partition
 # name from tmsh::pwd) before the substitution map is built. Each TCL
 # variable defined here is referenced by an entry in _SUBST_MAP below.
+# Also defines _escape_answer / _unescape_answer, used from here on.
 # ---------------------------------------------------------------------------
+# Every answer from the form lands in a double-quoted TCL string inside
+# an iRule body. Escape what would end that string or be evaluated in it,
+# or a quote in any text field fails the iRule load mid-deployment.
+proc _escape_answer { value } {
+    set bs [format %c 92]
+    set map [list]
+    foreach code {92 34 36 91 93} {
+        lappend map [format %c $code] $bs[format %c $code]
+    }
+    return [string map $map $value]
+}
+
+# The inverse, for reading an answer back out of a deployed iRule.
+proc _unescape_answer { value } {
+    set bs [format %c 92]
+    set map [list]
+    foreach code {92 34 36 91 93} {
+        lappend map $bs[format %c $code] [format %c $code]
+    }
+    return [string map $map $value]
+}
+
 # Resolve the FULL iApp app-folder path so that fully-qualified
 # iRule call statements inside the deployed iRules can find the
 # procs at runtime. The iApp framework creates iRules inside the
@@ -192,6 +221,24 @@ if { [info exists ::hssr__mode] && $::hssr__mode eq "install" } {
     set _hssr_irule ""
 }
 
+# Default sensor id. Each unit of an HA pair resolves its own hostname:
+# the sensor is the box that saw the request, not the cluster. Guarded,
+# because an optional telemetry label must never fail a deployment.
+set _device_hostname ""
+if { [catch {
+    set _gs [lindex [tmsh::get_config /sys global-settings] 0]
+    set _device_hostname [tmsh::get_field_value $_gs hostname]
+}] } {
+    set _device_hostname ""
+}
+if { $_device_hostname eq "" } {
+    # A warning, not a failure: the TRAFFIC iRule falls back to its
+    # runtime hostname. It must not be silent, though - and neither
+    # way of saying so may be what fails the deployment instead.
+    catch { puts "MIDEYE_SHIELD: device hostname unresolved; traffic source id falls back to the runtime hostname" }
+    catch { tmsh::log "MIDEYE_SHIELD iApp: device hostname unresolved at deploy time" }
+}
+
 # Resolve the HSSR helper virtual server path (passed as -virt to
 # HSSR::http_req). In install mode this is the bundled helper VS in
 # the app-folder; in existing mode it is the admin-supplied path.
@@ -206,6 +253,48 @@ if { [info exists ::hssr__mode] && $::hssr__mode eq "install" } {
 
 
 # ---------------------------------------------------------------------------
+# Username salt
+#
+# Generate a random salt if the administrator did not supply one. The salt
+# is read back from the running config on re-deploy so the value persists.
+# ---------------------------------------------------------------------------
+if { $::hash__username_salt eq "" } {
+    # Pull existing salt from the current iRule (if any) to avoid regenerating
+    # on every re-deploy, which would invalidate all previously hashed users.
+    set _existing_salt ""
+
+    catch {
+        # Mark-and-sweep converts tmsh::create to tmsh::modify on re-deploy,
+        # so the rule lives in the iApp folder. tmsh::get_config will find
+        # it by short name when run inside the iApp implementation context.
+        set _existing_rule [tmsh::get_config /ltm rule MIDEYE_SHIELD_COMMON]
+
+        # The salt is the last thing on its line, so a greedy match to the
+        # final quote needs no view of how the value itself is escaped.
+        regexp -line {^\s*set static::MIDEYE_SHIELD_username_salt\s+"(.*)"\s*$} $_existing_rule -> _existing_salt
+
+        # What the iRule holds is escaped for its double-quoted string. Undo
+        # that, or _escape_answer escapes it again on the way back in and the
+        # salt silently changes, invalidating every username hashed under it.
+        set _existing_salt [_unescape_answer $_existing_salt]
+    }
+
+    if { $_existing_salt ne "" } {
+        set ::hash__username_salt $_existing_salt
+    } else {
+        # Generate a fresh 32-character random salt
+        set _chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        set _salt ""
+
+        for { set _i 0 } { $_i < 32 } { incr _i } {
+            append _salt [string index $_chars [expr { int(rand() * [string length $_chars]) }]]
+        }
+
+        set ::hash__username_salt $_salt
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Build placeholder substitution map
 #
 # Every placeholder in the iRule bodies (e.g. __section__field__ for user
@@ -213,34 +302,40 @@ if { [info exists ::hssr__mode] && $::hssr__mode eq "install" } {
 # is mapped to its concrete value here. The map is built once and applied
 # to all iRule bodies below.
 # ---------------------------------------------------------------------------
-set _SUBST_MAP [list "__log__debug__" "$::log__debug" \
-    "__api__base_url__" "$::api__base_url" \
-    "__api__client_id__" "$::api__client_id" \
-    "__api__client_secret__" "$::api__client_secret" \
-    "__api__scope__" "$::api__scope" \
-    "__api__token_url__" "$::api__token_url" \
-    "__api__timeout__" "$::api__timeout" \
-    "__api__token_safeguard__" "$::api__token_safeguard" \
-    "__api__down_cache_time__" "$::api__down_cache_time" \
-    "__api__retry_after__" "$::api__retry_after" \
-    "__behaviour__disabled__" "$::behaviour__disabled" \
-    "__behaviour__dry_run__" "$::behaviour__dry_run" \
-    "__score__hard_deny__" "$::score__hard_deny" \
-    "__score__warn__" "$::score__warn" \
-    "__score__cache_time__" "$::score__cache_time" \
-    "__score__login_cache_time__" "$::score__login_cache_time" \
-    "__score__deny_cache_time__" "$::score__deny_cache_time" \
-    "__pending__max__" "$::pending__max" \
-    "__pending__poll_interval__" "$::pending__poll_interval" \
-    "__infra__dns__" "$::infra__dns" \
-    "__hash__username_salt__" "$::hash__username_salt" \
-    "__block__enabled__" "$::block__enabled" \
-    "__block__batch_size__" "$::block__batch_size" \
-    "__block__flush_interval__" "$::block__flush_interval" \
-    "__block__max_buffer__" "$::block__max_buffer" \
+set _SUBST_MAP [list "__log__debug__" "[_escape_answer $::log__debug]" \
+    "__api__base_url__" "[_escape_answer $::api__base_url]" \
+    "__api__client_id__" "[_escape_answer $::api__client_id]" \
+    "__api__client_secret__" "[_escape_answer $::api__client_secret]" \
+    "__api__scope__" "[_escape_answer $::api__scope]" \
+    "__api__token_url__" "[_escape_answer $::api__token_url]" \
+    "__api__timeout__" "[_escape_answer $::api__timeout]" \
+    "__api__token_safeguard__" "[_escape_answer $::api__token_safeguard]" \
+    "__api__down_cache_time__" "[_escape_answer $::api__down_cache_time]" \
+    "__api__retry_after__" "[_escape_answer $::api__retry_after]" \
+    "__behaviour__disabled__" "[_escape_answer $::behaviour__disabled]" \
+    "__behaviour__dry_run__" "[_escape_answer $::behaviour__dry_run]" \
+    "__score__hard_deny__" "[_escape_answer $::score__hard_deny]" \
+    "__score__warn__" "[_escape_answer $::score__warn]" \
+    "__score__cache_time__" "[_escape_answer $::score__cache_time]" \
+    "__score__login_cache_time__" "[_escape_answer $::score__login_cache_time]" \
+    "__score__deny_cache_time__" "[_escape_answer $::score__deny_cache_time]" \
+    "__pending__max__" "[_escape_answer $::pending__max]" \
+    "__pending__poll_interval__" "[_escape_answer $::pending__poll_interval]" \
+    "__infra__dns__" "[_escape_answer $::infra__dns]" \
+    "__hash__username_salt__" "[_escape_answer $::hash__username_salt]" \
+    "__block__enabled__" "[_escape_answer $::block__enabled]" \
+    "__block__batch_size__" "[_escape_answer $::block__batch_size]" \
+    "__block__flush_interval__" "[_escape_answer $::block__flush_interval]" \
+    "__block__max_buffer__" "[_escape_answer $::block__max_buffer]" \
+    "__traffic__enabled__" "[_escape_answer $::traffic__enabled]" \
+    "__traffic__batch_size__" "[_escape_answer $::traffic__batch_size]" \
+    "__traffic__flush_interval__" "[_escape_answer $::traffic__flush_interval]" \
+    "__traffic__max_buffer__" "[_escape_answer $::traffic__max_buffer]" \
+    "__traffic__sensor_id__" "[_escape_answer $::traffic__sensor_id]" \
     "__partition__" "$_partition" \
     "__base_partition__" "$_base_partition" \
     "__hssr_irule__" "$_hssr_irule" \
+    "__device_hostname__" "$_device_hostname" \
     "__hssr_helper_vs__" "$_hssr_helper_vs"]
 
 # ---------------------------------------------------------------------------
@@ -255,7 +350,7 @@ set _BODY_MIDEYE_SHIELD_APM {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_APM
 # Version : 0.9.5
-# iApp Version : 1.0.4
+# iApp Version : 1.0.5
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-06-10
 #
@@ -312,33 +407,31 @@ set _BODY_MIDEYE_SHIELD_APM {
 #
 # =============================================================================
 
+# Comments are stripped from this deployed copy: tmsh refuses a rule over
+# 65535 characters. The commented source is in the repository.
+
 when ACCESS_POLICY_AGENT_EVENT {
-    # Only act on the validate_ip event triggered from the access profile.
     set event [string toupper [ACCESS::policy agent_id]];
     if {$event == "MIDEYE_SHIELD-VALIDATE_IP"} {
         set allow [call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]]
         ACCESS::session data set session.custom.shield.allow $allow
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Allow status set to '$allow'"
     } elseif {$event == "MIDEYE_SHIELD-REPORT_AUTH_RESULT"} {
         set client_ip [ACCESS::session data get session.user.clientip]
         set reported_by [ACCESS::session data get session.server.network.name]
-
-        # Report the final authentication outcome back to the Shield API.
         call /__partition__/MIDEYE_SHIELD_COMMON::REPORT_AUTH_RESULT $client_ip $reported_by
     }
 }
-
 }
 
 # ----- iRule body: MIDEYE_SHIELD_COMMON -----
 set _BODY_MIDEYE_SHIELD_COMMON {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_COMMON
-# Version : 0.9.17
-# iApp Version : 1.0.4
+# Version : 0.9.19
+# iApp Version : 1.0.5
 # Author  : Magnus Sandin, Valitron AB
-# Date    : 2026-08-14
+# Date    : 2026-08-17
 #
 # Purpose
 # -------
@@ -482,10 +575,10 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 #
 # Dependencies - Session Table (subtable)
 # ----------------------------------------
-# Statistics, cache and token keys live in the subtable "MIDEYE_SHIELD".
-# The blocked-event buffer keeps its own subtable "MIDEYE_SHIELD_BLOCKS" so
-# neither can evict the other's keys. Key naming conventions used internally
-# in "MIDEYE_SHIELD":
+# Statistics, cache and token keys live in the subtable "MIDEYE_SHIELD". Each
+# event buffer owns a separate one - "MIDEYE_SHIELD_BLOCKS" and
+# "MIDEYE_SHIELD_TRAFFIC" - so no buffer can evict another's keys. Key naming
+# conventions used internally in "MIDEYE_SHIELD":
 #
 #   score_<ip>            - Cached score for an IP (-1 = under investigation)
 #   pending_<ip>          - Number of connections waiting for this IP's score
@@ -503,37 +596,24 @@ set _BODY_MIDEYE_SHIELD_COMMON {
 #   stat_allowed_score    - Counter: connections allowed due to acceptable score
 #   stat_blocked          - Counter: connections blocked
 #
-# And in "MIDEYE_SHIELD_BLOCKS", written only by the event buffer procs:
+# And in each buffer's subtable, written only by the event buffer procs:
 #
 #   seq                   - Sequence number of the last event enqueued
 #   cursor                - Sequence number of the last event flushed
 #   evt_<n>               - Buffered event body (JSON), keyed by sequence number
 #   flush_lock            - Ticket of the flusher currently holding the lock
 #   ticket                - Counter handing out unique flush lock tickets
-#   last_flush            - Epoch seconds of the last completed flush
+#   first_buffered        - Epoch seconds the oldest buffered event was enqueued
 #   dropped               - Counter: events discarded since the last flush
-#   backoff               - Present while flushing is paused after a token failure
+#   backoff               - Present while flushing is paused after a failed flush
 #
 # =============================================================================
 
+# Comments are stripped from this deployed copy: tmsh refuses a rule over
+# 65535 characters. The commented source is in the repository.
+
 when RULE_INIT {
-    # All Mideye Shield configuration settings are defined here as TCL static
-    # variables in the "static::" namespace, with prefix "MIDEYE_SHIELD_" to
-    # avoid collisions with any other iApp / iRule on the system.
-    #
-    # The __PLACEHOLDER__ tokens below are substituted by the Mideye Shield
-    # iApp implementation block at deployment time with values entered by the
-    # administrator in the iApp presentation form.
-    #
-    # NOTE: The iApp template generator script scans this block to discover
-    # which settings exist. Every variable declared here MUST have a matching
-    # entry in the iApp settings json (variables/labels/presentation) or the
-    # generator will emit a warning.
-
-    # API Settings
     set static::MIDEYE_SHIELD_log_debug              "__log__debug__"
-
-    # API Settings
     set static::MIDEYE_SHIELD_api_base_url           "__api__base_url__"
     set static::MIDEYE_SHIELD_api_client_id          "__api__client_id__"
     set static::MIDEYE_SHIELD_api_client_secret      "__api__client_secret__"
@@ -543,38 +623,29 @@ when RULE_INIT {
     set static::MIDEYE_SHIELD_api_token_safeguard    "__api__token_safeguard__"
     set static::MIDEYE_SHIELD_api_down_cache_time    "__api__down_cache_time__"
     set static::MIDEYE_SHIELD_api_retry_after        "__api__retry_after__"
-
-    # Behaviour flags
     set static::MIDEYE_SHIELD_disabled               "__behaviour__disabled__"
     set static::MIDEYE_SHIELD_dry_run                "__behaviour__dry_run__"
-
-    # Score thresholds and cache TTLs
     set static::MIDEYE_SHIELD_score_hard_deny        "__score__hard_deny__"
     set static::MIDEYE_SHIELD_score_warn             "__score__warn__"
     set static::MIDEYE_SHIELD_score_cache_time       "__score__cache_time__"
     set static::MIDEYE_SHIELD_login_score_cache_time "__score__login_cache_time__"
     set static::MIDEYE_SHIELD_score_deny_cache_time  "__score__deny_cache_time__"
-
-    # Pending queue and polling
     set static::MIDEYE_SHIELD_pending_max            "__pending__max__"
     set static::MIDEYE_SHIELD_pending_poll_interval  "__pending__poll_interval__"
-
-    # Infrastructure
     set static::MIDEYE_SHIELD_dns                    "__infra__dns__"
     set static::MIDEYE_SHIELD_hssr_helper_vs         "__hssr_helper_vs__"
-
-    # Hashing
     set static::MIDEYE_SHIELD_username_salt          "__hash__username_salt__"
-
-    # Blocked-event reporting
-    set static::MIDEYE_SHIELD_block_enabled        "__block__enabled__"
-    set static::MIDEYE_SHIELD_block_batch_size     "__block__batch_size__"
-    set static::MIDEYE_SHIELD_block_flush_interval "__block__flush_interval__"
-    set static::MIDEYE_SHIELD_block_max_buffer     "__block__max_buffer__"
-
-    # Escape map for JSON string values. Every byte outside printable ASCII
-    # is escaped because one byte of invalid UTF-8 makes an entire batch
-    # POST unparseable. The generator's cross-check ignores this static.
+    set static::MIDEYE_SHIELD_block_enabled          "__block__enabled__"
+    set static::MIDEYE_SHIELD_block_batch_size       "__block__batch_size__"
+    set static::MIDEYE_SHIELD_block_flush_interval   "__block__flush_interval__"
+    set static::MIDEYE_SHIELD_block_max_buffer       "__block__max_buffer__"
+    set static::MIDEYE_SHIELD_max_batch_bytes        921600
+    set static::MIDEYE_SHIELD_traffic_enabled        "__traffic__enabled__"
+    set static::MIDEYE_SHIELD_traffic_batch_size     "__traffic__batch_size__"
+    set static::MIDEYE_SHIELD_traffic_flush_interval "__traffic__flush_interval__"
+    set static::MIDEYE_SHIELD_traffic_max_buffer     "__traffic__max_buffer__"
+    set static::MIDEYE_SHIELD_traffic_sensor_id      "__traffic__sensor_id__"
+    set static::MIDEYE_SHIELD_traffic_device_hostname "__device_hostname__"
     set static::MIDEYE_SHIELD_json_map [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t \b \\b \f \\f]
     for { set c 0 } { $c < 256 } { incr c } {
         if { $c >= 0x20 && $c < 0x7f } { continue }
@@ -583,186 +654,153 @@ when RULE_INIT {
             [format %c $c] [format {\u%04x} $c]
     }
 }
-
-# ===========================================================================
-# P R I V A T E   P R O C E D U R E S
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# proc: _JSON_ESCAPE
-#
-# Escape a string for use in a JSON double-quoted value, using the map built
-# in RULE_INIT.
-# ---------------------------------------------------------------------------
 proc _JSON_ESCAPE { value } {
+    if { ![regexp {[^ -~]} $value] } {
+        return [string map {\\ \\\\ \" \\\"} $value]
+    }
     return [string map $static::MIDEYE_SHIELD_json_map $value]
 }
-
-# ---------------------------------------------------------------------------
-# proc: _ENQUEUE_EVENT
-#
-# Append one event (a JSON object string) to the buffer in subtable "sub"
-# and flush once batch_size events are buffered or flush_interval has passed
-# since the last flush. There is no timer, the time trigger fires on the
-# next event. When the buffer is full the event is dropped and counted.
-# Sizing comes as arguments so each caller owns its own buffer.
-# ---------------------------------------------------------------------------
-proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
+proc _BUFFER_EVENT { sub event_json batch_size flush_interval max_buffer } {
     set N      $batch_size
     set T      $flush_interval
     set MAXBUF $max_buffer
-
-    # The sizes come from free-text iApp fields. Fall back to the defaults
-    # rather than let Tcl compare non-numbers as strings.
-    if { ![string is integer -strict $N]      || $N < 1 }      { set N 200 }
+    if { ![string is integer -strict $N]      || $N < 1 }      { set N 1000 }
     if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
-    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 1000 }
-
-    # A batch size above the buffer cap could never be reached.
-    if { $N > $MAXBUF } { set N $MAXBUF }
-
-    # An event must outlive the interval it is waiting for.
-    set TTL [expr { $T * 2 + 60 }]
-
-    # Seed with "table add" so racing callers cannot claim the same number.
+    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 5000 }
+    set TTL [expr { $T * 2 + 360 }]
     table add -subtable $sub "seq" 0 indefinite indefinite
     set SEQ [table incr -subtable $sub "seq"]
-
     set CURSOR [table lookup -subtable $sub "cursor"]
     if { $CURSOR eq "" } { set CURSOR 0 }
     set BUFFERED [expr { $SEQ - $CURSOR }]
-
-    # Drop the event but still fall through to the flush trigger. Returning
-    # early would leave a full buffer nothing can ever drain.
     if { $BUFFERED > $MAXBUF } {
-        # Seeded like seq so the counter cannot expire between flushes.
         table add -subtable $sub "dropped" 0 indefinite indefinite
         table incr -subtable $sub "dropped"
     } else {
+        table add -subtable $sub "first_buffered" [clock seconds] indefinite indefinite
         table set -subtable $sub "evt_$SEQ" $event_json $TTL $TTL
     }
-
-    set LAST [table lookup -subtable $sub "last_flush"]
-    if { $LAST eq "" } { set LAST 0 }
-
-    if { $BUFFERED >= $N || ([clock seconds] - $LAST) >= $T } {
+    set BACKSTOP [expr { $N * 2 }]
+    set HALF     [expr { $MAXBUF / 2 }]
+    if { $BACKSTOP > $HALF } { set BACKSTOP $HALF }
+    set DUE 0
+    if { $BUFFERED >= $BACKSTOP } { set DUE 1 } else {
+        set FIRST [table lookup -subtable $sub "first_buffered"]
+        if { $FIRST eq "" || ([clock seconds] - $FIRST) >= $T * 2 } { set DUE 1 }
+    }
+    if { !$DUE } { return 0 }
+    if { [table lookup -subtable $sub "backoff"] ne "" } { return 0 }
+    return 1
+}
+proc _ENQUEUE_EVENT { sub event_json batch_size flush_interval max_buffer } {
+    call /__partition__/MIDEYE_SHIELD_COMMON::_BUFFER_EVENT $sub $event_json \
+        $batch_size $flush_interval $max_buffer
+    call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_IF_DUE $sub \
+        $batch_size $flush_interval $max_buffer
+}
+proc _ENQUEUE_EVENT_DEFERRED { sub event_json batch_size flush_interval max_buffer } {
+    if { [call /__partition__/MIDEYE_SHIELD_COMMON::_BUFFER_EVENT $sub $event_json \
+            $batch_size $flush_interval $max_buffer] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_IF_DUE $sub \
+            $batch_size $flush_interval $max_buffer
+    }
+}
+proc _FLUSH_IF_DUE { sub batch_size flush_interval max_buffer } {
+    set N      $batch_size
+    set T      $flush_interval
+    set MAXBUF $max_buffer
+    if { ![string is integer -strict $N]      || $N < 1 }      { set N 1000 }
+    if { ![string is integer -strict $T]      || $T < 1 }      { set T 10 }
+    if { ![string is integer -strict $MAXBUF] || $MAXBUF < 1 } { set MAXBUF 5000 }
+    if { $N > $MAXBUF } { set N $MAXBUF }
+    set CURSOR [table lookup -subtable $sub "cursor"]
+    if { $CURSOR eq "" } { set CURSOR 0 }
+    set SEQ [table lookup -subtable $sub "seq"]
+    if { $SEQ eq "" } { set SEQ 0 }
+    set BUFFERED [expr { $SEQ - $CURSOR }]
+    if { $BUFFERED < 1 } { return }
+    set FIRST [table lookup -subtable $sub "first_buffered"]
+    if { $BUFFERED >= $N || $FIRST eq "" || ([clock seconds] - $FIRST) >= $T } {
         call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_EVENTS $sub
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: _RELEASE_FLUSH_LOCK
-#
-# Release the flush lock only if we still hold it. A flusher that overran
-# its lock TTL has already been replaced and must not free the new holder's
-# lock.
-# ---------------------------------------------------------------------------
 proc _RELEASE_FLUSH_LOCK { sub ticket } {
     if { [table lookup -subtable $sub "flush_lock"] eq $ticket } {
         table delete -subtable $sub "flush_lock"
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: _FLUSH_EVENTS
-#
-# Collect up to 1000 buffered events (the Shield API per request cap) into
-# one {"events":[...]} body and POST it once over HSSR. A ticket lock
-# serialises flushers within one TMM (the session table is per TMM).
-#
-# Fire and forget: a failed POST drops the batch and logs a warning. The
-# exception is a missing API token, which keeps the batch and backs off.
-# ---------------------------------------------------------------------------
+proc _BACK_OFF { sub } {
+    set RETRY $static::MIDEYE_SHIELD_api_retry_after
+    if { ![string is integer -strict $RETRY] || $RETRY < 1 } { set RETRY 30 }
+    if { $RETRY > 60 } { set RETRY 60 }
+    table set -subtable $sub "backoff" 1 $RETRY $RETRY
+    return $RETRY
+}
 proc _FLUSH_EVENTS { sub } {
-    # Without this gate a token outage would cost one doomed token fetch per
-    # event, stalling the caller up to api_timeout per blocked connection.
     if { [table lookup -subtable $sub "backoff"] ne "" } { return }
-
     set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
-
-    # A non-numeric value would throw below and abort the caller's event.
     if { ![string is integer -strict $TIMEOUT] || $TIMEOUT < 1 } { set TIMEOUT 2500 }
-
     set LOCK_TTL [expr { int($TIMEOUT / 1000) + 5 }]
-
-    # Seed with "table add" so racing flushers cannot claim the same ticket.
     table add -subtable $sub "ticket" 0 indefinite indefinite
     set TICKET [table incr -subtable $sub "ticket"]
-
-    # What a declined add returns is not documented, so read the lock back.
-    # Only the holder sees its own ticket.
     table add -subtable $sub "flush_lock" $TICKET $LOCK_TTL $LOCK_TTL
     if { [table lookup -subtable $sub "flush_lock"] ne $TICKET } {
         return
     }
-
-    # Everything below destroys the events, so with no token give up here
-    # and leave the buffer intact for the next flush.
+    table delete -subtable $sub "first_buffered"
     set TOKEN ""
     if { [catch { set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN] } ERR] } {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: token lookup failed -> $ERR"
         set TOKEN ""
     }
-
     if { $TOKEN eq "" } {
-        set RETRY $static::MIDEYE_SHIELD_api_retry_after
-
-        if { ![string is integer -strict $RETRY] || $RETRY < 1 } { set RETRY 30 }
-
-        # Keep the backoff below the event TTL (at least 62s) or held events
-        # would expire and be lost as gaps, with no drop count.
-        if { $RETRY > 60 } { set RETRY 60 }
-
-        # Not _MARK_API_DOWN: a reporting failure must never stop scoring.
-        table set -subtable $sub "backoff" 1 $RETRY $RETRY
-
+        set RETRY [call /__partition__/MIDEYE_SHIELD_COMMON::_BACK_OFF $sub]
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: no valid API token, keeping buffered event(s) and backing off ${RETRY}s"
         call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $TICKET
         return
     }
-
     set CURSOR [table lookup -subtable $sub "cursor"]
     if { $CURSOR eq "" } { set CURSOR 0 }
     set SEQ [table lookup -subtable $sub "seq"]
     if { $SEQ eq "" } { set SEQ 0 }
-
     set END $SEQ
     if { [expr { $END - $CURSOR }] > 1000 } {
         set END [expr { $CURSOR + 1000 }]
     }
-
-    # Skip missing entries (dropped or expired). Stopping at a gap would
-    # wedge the cursor permanently.
+    set MAXBYTES $static::MIDEYE_SHIELD_max_batch_bytes
+    if { ![string is integer -strict $MAXBYTES] || $MAXBYTES < 1 } { set MAXBYTES 921600 }
     set EVENTS [list]
+    set BYTES  0
+    set TAKEN  $CURSOR
+    set EMPTY  0
     for { set I [expr { $CURSOR + 1 }] } { $I <= $END } { incr I } {
         set EVENT [table lookup -subtable $sub "evt_$I"]
         if { $EVENT ne "" } {
+            set SIZE [expr { [string length $EVENT] + 1 }]
+            if { [llength $EVENTS] > 0 && [expr { $BYTES + $SIZE }] > $MAXBYTES } { break }
             lappend EVENTS $EVENT
+            incr BYTES $SIZE
             table delete -subtable $sub "evt_$I"
+        } else {
+            incr EMPTY
         }
+        set TAKEN $I
     }
-
-    table set -subtable $sub "cursor" $END indefinite indefinite
-    table set -subtable $sub "last_flush" [clock seconds] indefinite indefinite
-
-    # Report drops here so the warning is rate limited to once per flush.
+    table set -subtable $sub "cursor" $TAKEN indefinite indefinite
     set DROPPED [table lookup -subtable $sub "dropped"]
     if { $DROPPED ne "" && $DROPPED > 0 } {
         table delete -subtable $sub "dropped"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: buffer full, dropped $DROPPED event(s) since the last flush"
     }
-
+    if { $EMPTY > 0 } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: $EMPTY event slot(s) empty at flush - expired unsent, or the drop(s) counted above"
+    }
     if { [llength $EVENTS] == 0 } {
         call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $TICKET
         return
     }
-
     set BODY "\{\"events\":\[[join $EVENTS ,]\]\}"
-
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "$sub: flushing [llength $EVENTS] event(s) to /ips/events"
-
-    # The batch is already consumed, so a failure can only be logged. Silence
-    # here would make a rejecting API look like an iApp seeing no traffic.
     set FAILURE ""
     if { [catch {
         set BASE_URL $static::MIDEYE_SHIELD_api_base_url
@@ -778,282 +816,121 @@ proc _FLUSH_EVENTS { sub } {
     } ERR] } {
         set FAILURE $ERR
     }
-
     if { $FAILURE ne "" } {
-        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: dropped [llength $EVENTS] event(s) -> $FAILURE"
+        set PAUSE [call /__partition__/MIDEYE_SHIELD_COMMON::_BACK_OFF $sub]
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "$sub: dropped [llength $EVENTS] event(s) -> $FAILURE; backing off ${PAUSE}s"
     }
-
     call /__partition__/MIDEYE_SHIELD_COMMON::_RELEASE_FLUSH_LOCK $sub $TICKET
 }
-
-# ---------------------------------------------------------------------------
-# proc:_LOG_COMMON
-#
-# DO NOT USE, this is an INTERNAL PROCEDURE
-#
-#  level: debug, info, warning, error, alert
-#    msg: Log message
-# noname: true | false (if true, don't log iRule name)
-#
-# Returns void
-# ---------------------------------------------------------------------------
 proc _LOG_COMMON {level msg {noname false}} {
     set chunk_size 750
-
     if {$noname} {
         set prefix "MIDEYE_SHIELD: "
     } else {
         set prefix ""
     }
-
     set id ""
-
     catch {
         set sid [ACCESS::session data get session.user.display_sessionid]
         if {$sid != ""} {
             set id "${sid}: "
         }
     }
-
     if {$id == ""} {
         catch { set id "<[IP::client_addr]:[TCP::client_port]>: " } ERR
     }
-
     append prefix $id
-
-    # Get the total length of the input string
     set len [string length $msg]
-
-    # If the string is empty, do nothing
     if {$len == 0} {
         return
     }
-
-    # Start position
     set start 0
-
     while {$start < $len} {
-        # Calculate end position for this chunk
         set end [expr {$start + $chunk_size}]
-
-        # Make sure we don't go beyond the string length
         if {$end > $len} {
             set end $len
         }
-
-        # Extract the substring for this chunk
         set chunk [string range $msg $start [expr {$end - 1}]]
-
         if {$start == 0} {
             set msgtolog "$prefix$chunk"
         } else {
             set msgtolog "$chunk"
         }
-
-        # Print the chunk
-        # Possibility to add conditional debugging
         if {$noname} {
             log -noname local0.$level "$msgtolog"
         } else {
             log local0.$level "$msgtolog"
         }
-
         if {$prefix != ""} {
             catch {ACCESS::log accesscontrol.$level $chunk}
         }
-
-        # Move to the next chunk
         set start $end
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: _TBL_GET
-#
-# Read a value from the Shield subtable.
-#
-# Returns empty string if the key does not exist.
-# ---------------------------------------------------------------------------
 proc _TBL_GET { key } {
     return [table lookup -subtable "MIDEYE_SHIELD" $key]
 }
-
-# ---------------------------------------------------------------------------
-# proc: _TBL_SET
-#
-# Write a value to the Shield subtable with a lifetime and idle timeout.
-# Both lifetime and idle_timeout are in seconds.
-#
-# Pass "indefinite" for either argument to mean never expire.
-# ---------------------------------------------------------------------------
 proc _TBL_SET { key value lifetime idle_timeout } {
     table set -subtable "MIDEYE_SHIELD" $key $value $lifetime $idle_timeout
 }
-
-# ---------------------------------------------------------------------------
-# proc: _TBL_DEL
-#
-# Delete a key from the Shield subtable.
-# ---------------------------------------------------------------------------
 proc _TBL_DEL { key } {
     table delete -subtable "MIDEYE_SHIELD" $key
 }
-
-# ---------------------------------------------------------------------------
-# proc: _TBL_INCR
-#
-# Atomically increment a counter in the Shield subtable.
-# On first creation (returns 1) the lifetime is set to indefinite so that
-# counters survive across connections.
-#
-# Returns the new value after increment.
-# ---------------------------------------------------------------------------
 proc _TBL_INCR { key } {
     set VAL [table incr -subtable "MIDEYE_SHIELD" $key]
-
     if { $VAL == 1 } {
-        # First time this counter is created - pin it so it never expires.
         table set -subtable "MIDEYE_SHIELD" $key 1 indefinite indefinite
     }
-
     return $VAL
 }
-
-# ---------------------------------------------------------------------------
-# proc: _SANITIZE_IP_KEY
-#
-# Replace characters in an IP address that could be problematic in a table
-# key. Specifically replaces colons in IPv6 addresses with underscores.
-# ---------------------------------------------------------------------------
 proc _SANITIZE_IP_KEY { ip } {
     return [string map {: _} $ip]
 }
-
-# ---------------------------------------------------------------------------
-# proc: _PARSE_JWT_EXP
-#
-# Extract the expiry (exp) claim from a JWT token.
-# JWT payload is base64url encoded. TCL base64 does not handle base64url so
-# we translate the alphabet before decoding. Padding is added as needed since
-# JWT omits it. The exp field is extracted with a regex.
-#
-# The pattern uses double-quote delimited strings to avoid TCL interpreting
-# the JSON quotes as brace delimiters.
-#
-# Returns 0 on any parse failure so the caller treats the token as expired.
-# ---------------------------------------------------------------------------
 proc _PARSE_JWT_EXP { token } {
-    # Split on dots and take the payload (second segment).
     set PARTS [split $token "."]
-
     if { [llength $PARTS] != 3 } {
         return 0
     }
-
     set PAYLOAD_B64URL [lindex $PARTS 1]
-
-    # Translate base64url alphabet to standard base64.
     set PAYLOAD_B64 [string map {- + _ /} $PAYLOAD_B64URL]
-
-    # Add missing base64 padding - JWT omits trailing = characters.
     set PAD [expr { (4 - ([string length $PAYLOAD_B64] % 4)) % 4 }]
     append PAYLOAD_B64 [string repeat "=" $PAD]
-
-    # Decode - wrap in catch because malformed input will throw.
     if { [catch { set DECODED [b64decode $PAYLOAD_B64] } ERR] } {
         return 0
     }
-
-    # Extract the exp integer from the decoded JSON payload.
-    # Pattern: "exp" followed by optional whitespace, colon, whitespace,
-    # then one or more digits captured in group 1.
     if { [regexp {"exp"\s*:\s*(\d+)} $DECODED -> EXP_VAL] } {
         return $EXP_VAL
     }
-
     return 0
 }
-
-# ---------------------------------------------------------------------------
-# proc: _GET_EPOCH
-#
-# Return current Unix epoch as integer.
-# ---------------------------------------------------------------------------
 proc _GET_EPOCH {} {
     return [clock seconds]
 }
-
-# ---------------------------------------------------------------------------
-# proc: _BUILD_HSSR_ARGS
-#
-# Build a base HSSR argument list in the caller's context via upvar.
-# If the named variable already exists it is appended to, not cleared.
-# Adds -method, -uri, -timeout, -virt and optionally -ns (when the dns
-# setting is non-empty).
-#
-# Arguments:
-#   var_name  - Name of the list variable in the caller's scope
-#   method    - HTTP method (GET or POST)
-#   uri       - Full URL including path and query string
-# ---------------------------------------------------------------------------
 proc _BUILD_HSSR_ARGS { var_name method uri } {
     upvar 1 $var_name ARGS
-
     set TIMEOUT $static::MIDEYE_SHIELD_api_timeout
     set HELPER  $static::MIDEYE_SHIELD_hssr_helper_vs
     set DNS     $static::MIDEYE_SHIELD_dns
-
     lappend ARGS \
         -method  $method \
         -uri     $uri \
         -timeout $TIMEOUT \
         -virt    $HELPER
-
     if { $DNS != "" } {
         lappend ARGS -ns $DNS
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: _MARK_API_DOWN
-#
-# Record that the API is currently unreachable and set the cache TTL based
-# on the api_down_cache_time setting.
-# ---------------------------------------------------------------------------
 proc _MARK_API_DOWN {} {
     set DOWN_TIME $static::MIDEYE_SHIELD_api_down_cache_time
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_SET "api_down" 1 $DOWN_TIME $DOWN_TIME
 }
-
-# ---------------------------------------------------------------------------
-# proc: _IS_API_DOWN
-#
-# Returns 1 if the API is currently marked as down in the cache, 0 otherwise.
-# ---------------------------------------------------------------------------
 proc _IS_API_DOWN {} {
     set STATE [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET "api_down"]
-
     if { $STATE eq "1" } {
         return 1
     }
-
     return 0
 }
-
-# ---------------------------------------------------------------------------
-# proc: _GET_VALID_TOKEN
-#
-# Return a valid API access token, fetching a new one if needed.
-#
-# Uses a binary "token_fetching" lock to prevent concurrent refresh storms.
-# The lock is claimed with "table add" and ownership is decided from the
-# return value. The sentinel is 1, so if a declined add returns the existing
-# value every racing context fetches its own token, each still valid. A
-# caller that does not win polls until the new token appears or the timeout
-# is exhausted.
-#
-# Returns empty string on failure.
-# ---------------------------------------------------------------------------
 proc _GET_VALID_TOKEN {} {
     set SAFEGUARD     $static::MIDEYE_SHIELD_api_token_safeguard
     set TIMEOUT       $static::MIDEYE_SHIELD_api_timeout
@@ -1063,138 +940,67 @@ proc _GET_VALID_TOKEN {} {
     set SCOPE         $static::MIDEYE_SHIELD_api_scope
     set POLL_INTERVAL $static::MIDEYE_SHIELD_pending_poll_interval
     set NOW           [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_EPOCH]
-
-    # Return cached token if it still has enough lifetime remaining.
     set CACHED_TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET "token"]
-
     if {$CACHED_TOKEN != ""} {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Returning cached token..."
         return $CACHED_TOKEN
     }
-
-    # Attempt to claim the fetch lock atomically.
-    # "table add" only inserts if the key is absent.
-    # Returns empty string when we own the lock, existing value otherwise.
     set SENTINEL_TTL [expr { int($TIMEOUT / 1000) + 5 }]
     set LOCK_RESULT  [table add -subtable "MIDEYE_SHIELD" "token_fetching" 1 $SENTINEL_TTL indefinite]
-
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "LOCK_RESULT: $LOCK_RESULT"
-
     if { $LOCK_RESULT != 1 } {
-        # Another context holds the lock - poll until token appears.
         set MAX_POLLS [expr { int($TIMEOUT / $POLL_INTERVAL) + 1}]
         set POLLS 0
-
         while {$POLLS < $MAX_POLLS} {
-            # Wait for lock to release
             after $POLL_INTERVAL
-
             set CACHED_TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET "token"]
-
             if {$CACHED_TOKEN != ""} {
                 return $CACHED_TOKEN
             }
-
             incr POLLS
         }
-
-        # Timed out waiting for the owning context to complete the fetch.
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "TIMEOUT WAITING for other thread fetching a TOKEN"
         return ""
     }
-
-    # We own the lock (LOCK_RESULT was 1). Perform the token fetch.
     set BODY "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&scope=${SCOPE}"
-
-    # Build the HSSR argument list with common options and optional DNS.
     call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${TOKEN_URL}"
-
     lappend ARGS \
         -body   $BODY \
         -type   "application/x-www-form-urlencoded" \
         -rbody  RESP_BODY
-
-    # Perform the sideband token request via HSSR.
-    # http_req returns the HTTP status code directly.
-    # The response body is received into RESP_BODY via -rbody.
     if { [catch {
         set STATUS [call __hssr_irule__::http_req $ARGS]
     } ERR] } {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Unable to get valid token -> '$ERR'"
-
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_fetching"
         return ""
     }
-
     if { $STATUS != 200 } {
         if {not([info exists RESP_BODY])} {
             set RESP_BODY ""
         }
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Unable to get valid token, status $STATUS -> '$RESP_BODY'"
-
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_fetching"
         return ""
     }
-
-    # Extract the access_token value from the JSON response body.
-    # The pattern matches: "access_token" : "< captured value >"
     if { ![regexp {"access_token"\s*:\s*"([^"]+)"} $RESP_BODY -> NEW_TOKEN] } {    #" <-- syntax highlighting WO
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_fetching"
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Unable to extract token value from JSON -> '$RESP_BODY'"
         return ""
     }
-
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "GOT A NEW_TOKEN" true
-
-    # Parse the exp claim from the token so we honour the server-issued lifetime.
     set EXP [call /__partition__/MIDEYE_SHIELD_COMMON::_PARSE_JWT_EXP $NEW_TOKEN]
-
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "TOKEN EXP: '$EXP'"
-
     if { $EXP == 0 } {
-        # Could not parse exp - fall back to a conservative 5-minute cache.
         set EXP [expr { [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_EPOCH] + 300 }]
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Setting default EXP to: '$EXP'"
     }
-
-    # Cache the token and its expiry using the remaining token lifetime as TTL.
     set TTL [expr {$EXP - [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_EPOCH] - $SAFEGUARD}]
-
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "TOKEN TTL: '$TTL'"
-
-    # Save the new token in the cahce
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_SET "token" $NEW_TOKEN $TTL $TTL
-
-    # Release the lock so a future expiry triggers a fresh fetch.
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL "token_fetching"
-
     return $NEW_TOKEN
 }
-
-# ---------------------------------------------------------------------------
-# proc: _FETCH_IP_SCORE
-#
-# Call the Shield API to get a risk score for the given IP address.
-# Manages the pending-connections counter and the score sentinel (-1).
-#
-# The API returns a JSON object with a nested riskScore structure:
-#   {"ipAddress":"x.x.x.x","riskScore":{"overall":N,"severity":N,"velocity":N}}
-# The "overall" field is used as the score for allow/deny decisions.
-#
-# The cache_time argument controls how long the resolved score is cached.
-# Callers pass different values depending on context (connection vs login).
-#
-# The pending counter uses "table incr" for the initial claim (first caller
-# gets 1 and becomes the API fetcher) and "table incr <key> -1" to release
-# the slot when a waiter is done. Both operations are atomic.
-#
-# Return values:
-#   0-100  - resolved score from the API
-#   -2     - API failure (token unavailable, request error, bad response)
-#   -3     - pending queue for this IP is full (deny_pending_max)
-# ---------------------------------------------------------------------------
 proc _FETCH_IP_SCORE { client_ip cache_time } {
     set TCP_COLLECT     {TCP::collect}
     set TCP_RELEASE     {TCP::release}
@@ -1205,20 +1011,13 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
     set PENDING_MAX     $static::MIDEYE_SHIELD_pending_max
     set POLL_INTERVAL   $static::MIDEYE_SHIELD_pending_poll_interval
     set BASE_URL        $static::MIDEYE_SHIELD_api_base_url
-
     set SCORE_PATH    /ips
-
-    # --- Cache check ---
     set CACHED    [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET $SCORE_KEY]
-
-    # Check if we have a cached value
     if {$CACHED != "" && $CACHED >= 0} {
         set CACHED_VALUE_LIFETIME [table lookup -subtable "MIDEYE_SHIELD" $SCORE_KEY]
-
         if {$CACHED_VALUE_LIFETIME != -1 && $CACHED_VALUE_LIFETIME <= $cache_time} {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_cache_hits"
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Using Cached Risk Score of '$CACHED' for '$client_ip'"
-
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             return $CACHED
         } else {
@@ -1226,153 +1025,90 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
         }
     }
-
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_cache_misses"
-
-    # If the API is known to be down, fail open immediately.
     if {[call /__partition__/MIDEYE_SHIELD_COMMON::_IS_API_DOWN]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_api_fail"
-        #call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_apifail"
         return -2
     }
-
-    # Missing cached value, we need to fetch a score from the API
-    #
-    # Atomically increment the pending counter for this IP.
-    # The first caller gets 1 and is elected as the API caller.
-    # All subsequent callers get a higher value and become waiters.
     set PEND_VAL [table incr -subtable "MIDEYE_SHIELD" $PEND_KEY]
-
-    # Check if this is the first thread that need a score for this IP
     if {$PEND_VAL == 1} {
-        # We are the first caller, set TTLs and write the investigation sentinel.
-        # The pending key TTL is tied to api_timeout so it self-clears on crash.
         set TIMEOUT_SECS [expr { int($TIMEOUT / 1000) + 1 }]
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will fetch Score for '$SAFE_IP', PEND_VAL: $PEND_VAL"
-
         set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
-
         if {$TOKEN == ""} {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_MARK_API_DOWN
-
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: Unable to fetch API Token"
             return -2
         }
-
-        # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "GET" "${BASE_URL}${SCORE_PATH}/${client_ip}"
         lappend ARGS \
             -headers [list "Authorization" "Bearer ${TOKEN}"] \
             -rbody   RESP_BODY
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Fetching Score for '$SAFE_IP'"
-
-        # Perform the sideband score request via HSSR.
-        # http_req returns the HTTP status code directly.
-        # The response body is received into RESP_BODY via -rbody.
         if { [catch {
             set STATUS [call __hssr_irule__::http_req $ARGS]
         } ERR] } {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_MARK_API_DOWN
-
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: Unable to fetch IP Score from API"
             return -2
         }
-
         if { $STATUS != 200 } {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_MARK_API_DOWN
-
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: Unable to fetch IP Score from API ($STATUS) -> '{$RESP_BODY}'"
             return -2
         }
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Fetch TOKEN RESP_BODY: $RESP_BODY"
-
-        # Parse the overall risk score from the JSON response body.
-        # The API returns: {"ipAddress":"...","riskScore":{"overall":N,...}}
-        # Pattern matches: "overall" : <digits> inside the riskScore object.
         if { ![regexp {"overall"\s*:\s*(\d+)} $RESP_BODY -> SCORE] } {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $SCORE_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             call /__partition__/MIDEYE_SHIELD_COMMON::_MARK_API_DOWN
-
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: Unable to parse riskScore.overall from API Response -> '{$RESP_BODY}'"
             return -2
         }
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "SCORE: SCORE: '$SCORE' for '$SAFE_IP'"
-
-        # Decide the cache TTL for this resolved score. A score that will be
-        # hard-denied does not need to be re-checked against the API every few
-        # seconds, so it is cached for much longer (deny_cache_time, default
-        # 24h). Any score below the hard-deny threshold keeps the caller's
-        # normal TTL (the connection or login cache time).
         set HARD_DENY_THRESHOLD $static::MIDEYE_SHIELD_score_hard_deny
         set DENY_CACHE_TIME     $static::MIDEYE_SHIELD_score_deny_cache_time
-
         set EFFECTIVE_CACHE_TIME $cache_time
-
         if { $SCORE >= $HARD_DENY_THRESHOLD } {
             set EFFECTIVE_CACHE_TIME $DENY_CACHE_TIME
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Caching denied IP '$SAFE_IP' score '$SCORE' for extended TTL '$EFFECTIVE_CACHE_TIME's"
         }
-
-        # Write the resolved score to cache and release the pending key.
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_SET $SCORE_KEY $SCORE $EFFECTIVE_CACHE_TIME $EFFECTIVE_CACHE_TIME
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
-
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_api_success"
         return $SCORE
-
-    # Else someone else is fetching the Score and we just need to wait for that thread
     } else {
-        # We are a waiter. Reject immediately if the queue is already full.
         if {$PEND_VAL > $PENDING_MAX} {
-            # Release our slot with an atomic decrement before returning.
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: Requests in queue, rejecting due to full wait list"
-
             set NEW_PENDING_COUNT [table incr -subtable "MIDEYE_SHIELD" $PEND_KEY -1]
-
-            # TODO check the value 2000
             if {$NEW_PENDING_COUNT > 2000 || $NEW_PENDING_COUNT <= 0} {
                 call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
             }
-
             return -3
         }
-
-        # Poll the score key until it resolves, is deleted, or we time out.
         set MAX_POLLS [expr { int($TIMEOUT / $POLL_INTERVAL) }]
         set POLLS 0
-
         set MIDEYE_SHIELD_WAITING 1
         catch {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will try to COLLECT Data (POLLS: $MAX_POLLS, TIME: $POLL_INTERVAL)"
             eval $TCP_COLLECT
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "COLLECT Succeded"
         }
-
         while {$POLLS < $MAX_POLLS} {
             after $POLL_INTERVAL
-
             set CACHED_SCORE [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET $SCORE_KEY]
-
-            # A real score (not the -1 sentinel) means the fetcher succeeded.
             if { $CACHED_SCORE != "" && $CACHED_SCORE != -1 } {
                 call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
                 catch { eval $TCP_RELEASE }
                 set MIDEYE_SHIELD_WAITING 0
                 return $CACHED_SCORE
             }
-
-            # Empty key means the fetcher deleted it due to an API failure.
             if { $CACHED_SCORE == "" } {
                 call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
                 call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: API Failure?"
@@ -1380,59 +1116,31 @@ proc _FETCH_IP_SCORE { client_ip cache_time } {
                 set MIDEYE_SHIELD_WAITING 0
                 return -2
             }
-
             incr POLLS
         }
-
         catch { eval $TCP_RELEASE }
         set MIDEYE_SHIELD_WAITING 0
-
-        # Timed out waiting for the fetcher - treat as API failure.
         set NEW_PENDING_COUNT [table incr -subtable "MIDEYE_SHIELD" $PEND_KEY -1]
-
-        # TODO check the value 2000
         if {$NEW_PENDING_COUNT > 2000 || $NEW_PENDING_COUNT <= 0} {
             call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_DEL $PEND_KEY
         }
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING: Timeout waiting for API Caller"
         return -2
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: _REPORT_BLOCK
-#
-# Buffer one "blocked" event for an IP this device refused. Fire and forget.
-# Called only after the dry run check, so an event always reflects a real
-# block. The pending-queue-full deny does not report: that is a capacity
-# deny of a possibly innocent IP. enforced_name is score_hard_deny or
-# blacklist.
-# ---------------------------------------------------------------------------
 proc _REPORT_BLOCK { client_ip enforced_name } {
-    # Compared against "0" so a hand-installed iRule with the placeholder
-    # unsubstituted still reports.
     if { $static::MIDEYE_SHIELD_block_enabled == "0" } { return }
-
-    # An uncaught throw here would abort the caller's iRule event. Reporting
-    # must never change what happens to the connection.
     if { [catch {
         set VS ""
         catch { set VS [virtual name] }
-
-        # enforcedBy.id is required and non-empty in the API schema. An
-        # empty id would fail validation for the whole batch.
         if { $VS eq "" } { set VS "mideye_shield" }
-
         set TS [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]
-
         set J "\{\"ipAddress\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $client_ip]\""
         append J ",\"observedAt\":\"$TS\""
         append J ",\"authentication\":\{\"outcome\":\"blocked\""
         append J ",\"enforcedBy\":\{\"id\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $VS]\""
         append J ",\"name\":\"[call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $enforced_name]\""
         append J ",\"type\":\"irule\",\"provider\":\"f5_bigip\"\}\}\}"
-
         call /__partition__/MIDEYE_SHIELD_COMMON::_ENQUEUE_EVENT "MIDEYE_SHIELD_BLOCKS" $J \
             $static::MIDEYE_SHIELD_block_batch_size \
             $static::MIDEYE_SHIELD_block_flush_interval \
@@ -1441,255 +1149,124 @@ proc _REPORT_BLOCK { client_ip enforced_name } {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Unable to report block for '$client_ip' -> '$ERR'"
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: _VALIDATE
-#
-# Internal shared validation logic used by VALIDATE_CONNECTION and
-# VALIDATE_LOGIN. The cache_time argument determines how long a resolved
-# score is cached, allowing different TTLs per call context.
-#
-# Returns 1 to allow, 0 to reject.
-# ---------------------------------------------------------------------------
 proc _VALIDATE { client_ip cache_time } {
-    # Read control flags and thresholds once to stay consistent for this call.
     set DISABLED            $static::MIDEYE_SHIELD_disabled
     set DRY_RUN             $static::MIDEYE_SHIELD_dry_run
     set HARD_DENY_THRESHOLD $static::MIDEYE_SHIELD_score_hard_deny
     set WARN_THRESHOLD      $static::MIDEYE_SHIELD_score_warn
-
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE $client_ip $cache_time: DISABLED: $DISABLED"
-
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_requests"
-
-    # Disabled flag short-circuits everything - no logging, no checks.
     if {$DISABLED == "1"} {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 1 (Disabled)"
         return 1
     }
-
-    # Clean up the IP from potential Route Domain
     set client_ip [lindex [split $client_ip "%"] 0]
-
-    # --- Blacklist check (highest priority) ---
     if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_BLACKLIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blacklisted"
-
         if {$DRY_RUN == "1"} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied '$client_ip' due to blacklist match"
             return 1
         }
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "IP '$client_ip' DENIED due to blacklist match"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 2 (Blacklisted)"
         call /__partition__/MIDEYE_SHIELD_COMMON::_REPORT_BLOCK $client_ip "blacklist"
         return 0
     }
-
-    # --- Whitelist check ---
     if {[class match $client_ip equals /__base_partition__/MIDEYE_SHIELD_WHITELIST]} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_whitelisted"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 3 (Whitelisted)"
         return 1
     }
-
-    # --- Get New or Cached Risk Score ---
-    # Fetch the score, handles pending counter and wait logic internally.
-    # Pass cache_time so the fetcher caches with the correct TTL.
     set SCORE [call /__partition__/MIDEYE_SHIELD_COMMON::_FETCH_IP_SCORE $client_ip $cache_time]
-
-    # Pending queue for this IP is full - treat as a hard deny.
     if {$SCORE == -3} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blocked"
-
         if {$DRY_RUN == "1"} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied IP due to too many pending connections from '$client_ip'"
             return 1
         }
-
-        # TODO, config for this?
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 5 (Pending Queue FULL)"
         return 0
     }
-
-    # API failure or timeout waiting for a score - fail open.
     if {$SCORE == -2} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_apifail"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 6 (API Timeout)"
         return 1
     }
-
-    # --- Score evaluation ---
     if {$SCORE >= $HARD_DENY_THRESHOLD} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_blocked"
-
         if {$DRY_RUN == "1"} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "DRY RUN - Would have denied '$client_ip' due to high score of '$SCORE'"
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE exit branch 7 (Dry Run, and HIGH Score)"
             return 1
         }
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "DENY '$client_ip' due to too high score '$SCORE'"
         call /__partition__/MIDEYE_SHIELD_COMMON::_REPORT_BLOCK $client_ip "score_hard_deny"
         return 0
     }
-
     if {$SCORE >= $WARN_THRESHOLD} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_score"
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "WARNING '$client_ip' score '$SCORE' is inside the warn band"
         return 1
     }
-
     call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_INCR "stat_allowed_score"
     call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "INSIDE _VALIDATE main exit (ALLOWED)"
     return 1
 }
-
-# ===========================================================================
-# P U B L I C   P R O C E D U R E S
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# proc: LOG_ALERT
-#
-# Sends log message to the ALERT log
-#
-# Returns void
-# ---------------------------------------------------------------------------
 proc LOG_ALERT {msg {noname false}} {
     call /__partition__/MIDEYE_SHIELD_COMMON::_LOG_COMMON alert $msg $noname
 }
-
-# ---------------------------------------------------------------------------
-# proc: LOG_ERROR
-#
-# Sends log message to the ERROR log
-#
-# Returns void
-# ---------------------------------------------------------------------------
 proc LOG_ERROR {msg {noname false}} {
     call /__partition__/MIDEYE_SHIELD_COMMON::_LOG_COMMON error $msg $noname
 }
-
-# ---------------------------------------------------------------------------
-# proc: LOG_WARNING
-#
-# Sends log message to the WARN log
-#
-# Returns void
-# ---------------------------------------------------------------------------
 proc LOG_WARNING {msg {noname false}} {
     call /__partition__/MIDEYE_SHIELD_COMMON::_LOG_COMMON warning $msg $noname
 }
-
-# ---------------------------------------------------------------------------
-# proc: LOG_INFO
-#
-# Sends log message to the INFO log
-#
-# Returns void
-# ---------------------------------------------------------------------------
 proc LOG_INFO {msg {noname false}} {
     call /__partition__/MIDEYE_SHIELD_COMMON::_LOG_COMMON info $msg $noname
 }
-
-# ---------------------------------------------------------------------------
-# proc: LOG_DEBUG
-#
-# Sends log message to the DEBUG log if debug has been enabled in settings
-#
-# Returns void
-# ---------------------------------------------------------------------------
 proc LOG_DEBUG {msg {noname false}} {
     if {$static::MIDEYE_SHIELD_log_debug == 1} {
         call /__partition__/MIDEYE_SHIELD_COMMON::_LOG_COMMON debug $msg $noname
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: VALIDATE_CONNECTION
-#
-# Validates an IP at the TCP connection level. Uses score_cache_time from
-# settings as the cache TTL, which is typically a longer value (e.g. 300s).
-#
-# Returns 1 to allow, 0 to reject.
-#
-#   if { ![call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_CONNECTION [IP::client_addr]] } {
-#       reject
-#   }
-# ---------------------------------------------------------------------------
 proc VALIDATE_CONNECTION { client_ip } {
     set CACHE_TIME $static::MIDEYE_SHIELD_score_cache_time
     return [call /__partition__/MIDEYE_SHIELD_COMMON::_VALIDATE $client_ip $CACHE_TIME]
 }
-
-# ---------------------------------------------------------------------------
-# proc: VALIDATE_LOGIN
-#
-# Validates an IP at the login/APM level. Uses login_score_cache_time from
-# settings as the cache TTL, which is typically a shorter value (e.g. 10s)
-# to ensure a fresher score is used before authenticating a user.
-#
-# Returns 1 to allow, 0 to reject.
-#
-#   if { ![call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_LOGIN [IP::client_addr]] } {
-#       reject
-#   }
-# ---------------------------------------------------------------------------
 proc VALIDATE_LOGIN { client_ip } {
     set CACHE_TIME $static::MIDEYE_SHIELD_login_score_cache_time
     return [call /__partition__/MIDEYE_SHIELD_COMMON::_VALIDATE $client_ip $CACHE_TIME]
 }
-
-# ---------------------------------------------------------------------------
-# proc: REPORT_AUTH_RESULT
-#
-# Report an authentication result for an IP back to the Shield API.
-#
-# Called from the APM iRule after ACCESS_POLICY_COMPLETED.
-# This is fire-and-forget - errors are logged but never propagated.
-# ---------------------------------------------------------------------------
 proc REPORT_AUTH_RESULT { client_ip { reported_by "" } } {
     set status ""
-
     catch {
         set TOKEN [call /__partition__/MIDEYE_SHIELD_COMMON::_GET_VALID_TOKEN]
-
         if {$TOKEN == ""} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "REPORT_AUTH_RESULT - No valid API token, skipping report for '$client_ip'"
             return
         }
-
         set SALT        $static::MIDEYE_SHIELD_username_salt
-
         set BASE_URL    $static::MIDEYE_SHIELD_api_base_url
         set REPORT_PATH /ips/events
-
         set reason  [string tolower [ACCESS::session data get session.custom.shield.reason]]
         set method  [string tolower [ACCESS::session data get session.custom.shield.method]]
         set user    [ACCESS::session data get session.logon.last.username]
         set outcome $reason
-
         if {$SALT == ""} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "username_salt is empty, consider setting a unique value in the Mideye Shield iApp"
         }
-
         if {$method == ""} {
             set method "unknown"
         }
-
         if {$reason == ""} {
-            # If the reason was not set, we just skip reporting
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_INFO "Reason was not set, will skip reporting, ipAddress: '$client_ip', username: '$user'"
             return
         }
-
         set hashed_user ""
         if {$user != ""} {
             call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Will HASH: '${SALT}${user}'"
             binary scan [sha512 "${SALT}${user}"] H* hashed_user
         }
-
         set BODY    "\{"
         append BODY "\"events\": \["
         append BODY "\{"
@@ -1697,55 +1274,35 @@ proc REPORT_AUTH_RESULT { client_ip { reported_by "" } } {
         append BODY ",\"observedAt\": \"[clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]\""
         append BODY ",\"authentication\": \{"
         append BODY "\"outcome\": \"$outcome\""
-
         if {$reported_by != ""} {
             append BODY ",\"enforcedBy\": {\"id\": \"$reported_by\"}"
         }
-
         if {$hashed_user != ""} {
             append BODY ",\"usernameHash\": \"$hashed_user\""
         }
-
         if {$outcome == "success"} {
             append BODY ",\"method\": \"$method\""
         }
-
         append BODY "\}"
         append BODY "\}"
         append BODY "\]"
         append BODY "\}"
-
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "Sending Auth Result: Outcome: '$outcome', ipAddress: '$client_ip', reported_by: '$reported_by', username: '$user'"
-
-        # Build the HSSR argument list with common options and optional DNS.
         call /__partition__/MIDEYE_SHIELD_COMMON::_BUILD_HSSR_ARGS ARGS "POST" "${BASE_URL}${REPORT_PATH}"
         lappend ARGS \
             -headers [list "Authorization" "Bearer ${TOKEN}"] \
             -body    $BODY \
             -type    "application/json"
-
-        # Fire and forget - catch but discard any error.
         catch {
             set status [call __hssr_irule__::http_req $ARGS]
         }
     } err
-
     if {$err != "" && $err != 0} {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "Something went wrong when sending result to SHIELD: '$err'"
     } else {
         call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "STATUS CODE from /ips/events: '$status'"
     }
 }
-
-# ---------------------------------------------------------------------------
-# proc: GET_STATS
-#
-# Return a flat {key value key value ...} list of all statistics counters.
-# Callers iterate it with:
-#   foreach {K V} [call /__partition__/MIDEYE_SHIELD_COMMON::GET_STATS] { ... }
-#
-# Note: the snapshot is not atomic across all keys - use for monitoring only.
-# ---------------------------------------------------------------------------
 proc GET_STATS {} {
     set KEYS {
         stat_requests
@@ -1759,27 +1316,16 @@ proc GET_STATS {} {
         stat_allowed_score
         stat_blocked
     }
-
     set RESULT {}
-
     foreach KEY $KEYS {
         set VAL [call /__partition__/MIDEYE_SHIELD_COMMON::_TBL_GET $KEY]
-
         if { $VAL eq "" } {
             set VAL 0
         }
-
         lappend RESULT $KEY $VAL
     }
-
     return $RESULT
 }
-
-# ---------------------------------------------------------------------------
-# proc: RESET_STATS
-#
-# Reset all statistics counters to zero.
-# ---------------------------------------------------------------------------
 proc RESET_STATS {} {
     set KEYS {
         stat_requests
@@ -1793,26 +1339,19 @@ proc RESET_STATS {} {
         stat_allowed_score
         stat_blocked
     }
-
     foreach KEY $KEYS {
         table set -subtable "MIDEYE_SHIELD" $KEY 0 indefinite indefinite
     }
 }
-
-# These two events are needed so we can use "after" while waiting
-# for another task to complete fetching of a score to the local cache
 when CLIENT_ACCEPTED {
     set MIDEYE_SHIELD_WAITING 0
 }
-
 when CLIENT_DATA {
-    # If we are waiting, we need to keep collecting data until it has finished
     if {$MIDEYE_SHIELD_WAITING == 1} {
         TCP::collect
         return
     }
 }
-
 }
 
 # ----- iRule body: MIDEYE_SHIELD_CONNECTION -----
@@ -1820,7 +1359,7 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 # =============================================================================
 # iRule   : MIDEYE_SHIELD_CONNECT
 # Version : 0.9.2
-# iApp Version : 1.0.4
+# iApp Version : 1.0.5
 # Author  : Magnus Sandin, Valitron AB
 # Date    : 2026-05-18
 #
@@ -1855,15 +1394,595 @@ set _BODY_MIDEYE_SHIELD_CONNECTION {
 #
 # =============================================================================
 
+# Comments are stripped from this deployed copy: tmsh refuses a rule over
+# 65535 characters. The commented source is in the repository.
+
 when CLIENT_ACCEPTED {
-    # Validate the connecting IP against the Shield.
-    # VALIDATE_IP returns 1 to allow, 0 to reject.
-    # All logging and counter updates are handled inside VALIDATE_IP.
     if { ![call /__partition__/MIDEYE_SHIELD_COMMON::VALIDATE_CONNECTION [IP::client_addr]] } {
         reject
     }
 }
+}
 
+# ----- iRule body: MIDEYE_SHIELD_TRAFFIC -----
+set _BODY_MIDEYE_SHIELD_TRAFFIC {
+# =============================================================================
+# iRule   : MIDEYE_SHIELD_TRAFFIC
+# Version : 0.1.0
+# iApp Version : 1.0.5
+# Author  : Mideye
+# Date    : 2026-08-17
+#
+# Purpose
+# -------
+# This iRule reports TLS and HTTP client fingerprints for all traffic reaching
+# a protected Virtual Server, not only for authentication attempts. JA3 and JA4
+# are computed from the raw ClientHello; the first HTTP request on a connection
+# also reports its shape, every later request only what can differ.
+#
+# Apply this iRule where the client speaks first - TLS, and HTTP over it.
+# CLIENT_ACCEPTED collects the handshake, which holds the serverside connection
+# back until the client sends, so a server-first protocol (SSH, SMTP, FTP)
+# hangs until the TCP profile times it out.
+#
+# Reporting is on by default and can be turned off in the iApp, which leaves
+# the iRule loaded but inert. When it shares a Virtual Server with
+# MIDEYE_SHIELD_CONNECTION, list it after that iRule so the enforcement
+# decision completes first.
+#
+# See docs/traffic-intelligence.md for the event shape and the design notes.
+#
+#
+# Privacy
+# -------
+# Header NAMES are reported in the order the client sent them, header VALUES
+# only for Host, Accept-Language and User-Agent. Paths are reported without
+# their query string, and headers in traffic_forbidden_headers not at all.
+# docs/traffic-intelligence.md lists everything that leaves the device.
+#
+#
+# Dependencies - iRules (call targets)
+# -------------------------------------
+#   /__partition__/MIDEYE_SHIELD_COMMON
+#       Shared library: _ENQUEUE_EVENT_DEFERRED, _FLUSH_IF_DUE, _JSON_ESCAPE
+#       and LOG_*. The traffic_* settings are declared in its RULE_INIT.
+#
+#
+# Dependencies - Session Table (subtable)
+# ----------------------------------------
+# Buffered events live in "MIDEYE_SHIELD_TRAFFIC", written only by COMMON's
+# event buffer procs. See MIDEYE_SHIELD_COMMON for the key conventions.
+#
+#
+# Provenance
+# ----------
+# The ClientHello parsing is adapted from f5devcentral/f5-ja4 and redistributed
+# under the BSD 3-Clause terms below, which that license requires source
+# redistributions to retain. JA3 is reimplemented from Salesforce's published
+# method rather than copied. The JA4+ variants (JA4H, JA4S, JA4L, ...) are
+# under the separate FoxIO License 1.1 and are not implemented here.
+#
+#   Copyright (c) 2024, FoxIO
+#   All rights reserved.
+#   Software: JA4 (TLS client fingerprinting)
+#
+#   Redistribution and use in source and binary forms, with or without
+#   modification, are permitted provided that the following conditions are
+#   met:
+#
+#   * Redistributions of source code must retain the above copyright notice,
+#     this list of conditions and the following disclaimer.
+#
+#   * Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#
+#   * Neither the name of FoxIO nor the names of its contributors may be used
+#     to endorse or promote products derived from this software without
+#     specific prior written permission.
+#
+#   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+#   PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+#   HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+#   TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+#   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+#   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+#   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+#   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# =============================================================================
+
+# Comments are stripped from this deployed copy: tmsh refuses a rule over
+# 65535 characters. The commented source is in the repository.
+
+when RULE_INIT {
+    set static::MIDEYE_SHIELD_traffic_max_record 17408
+    set static::MIDEYE_SHIELD_traffic_max_iter   256
+    set static::MIDEYE_SHIELD_traffic_max_headers 2048
+    set static::MIDEYE_SHIELD_traffic_max_event   8192
+    set static::MIDEYE_SHIELD_traffic_forbidden_headers "authorization set-cookie x-api-key x-auth-token proxy-authorization x-csrf-token x-xsrf-token"
+}
+proc _HEADER_VALUE_CAP { name } {
+    switch -- [string tolower $name] {
+        "host"            { return 255 }
+        "accept-language" { return 255 }
+        default           { return "" }
+    }
+}
+proc _MAP_HTTP_VERSION { v } {
+    switch -- $v {
+        "1.0"   { return "HTTP/1.0" }
+        "1.1"   { return "HTTP/1.1" }
+        "2.0"   { return "HTTP/2" }
+        "2"     { return "HTTP/2" }
+        "3.0"   { return "HTTP/3" }
+        "3"     { return "HTTP/3" }
+        default { return "" }
+    }
+}
+proc _MAP_TLS_VERSION { v2 } {
+    switch -- $v2 {
+        "13"    { return "TLSv1.3" }
+        "12"    { return "TLSv1.2" }
+        "11"    { return "TLSv1.1" }
+        "10"    { return "TLSv1.0" }
+        default { return "" }
+    }
+}
+proc _U16_VECTOR { payload off limit len_bytes } {
+    if { $off + $len_bytes > $limit } { return "REJECT" }
+    if { $len_bytes == 1 } {
+        binary scan $payload @${off}c vec_len
+        set vec_len [expr { $vec_len & 0xff }]
+    } else {
+        binary scan $payload @${off}S vec_len
+        set vec_len [expr { $vec_len & 0xffff }]
+    }
+    set pos [expr { $off + $len_bytes }]
+    set end [expr { $pos + $vec_len }]
+    if { ($vec_len % 2) != 0 || $end > $limit } { return "REJECT" }
+    set out  [list]
+    set iter 0
+    while { $pos + 2 <= $end } {
+        if { [incr iter] > $static::MIDEYE_SHIELD_traffic_max_iter } { return "REJECT" }
+        binary scan $payload @${pos}H4 entry_hex
+        set entry [scan $entry_hex %x]
+        incr pos 2
+        if { ($entry & 0x0f0f) == 0x0a0a && (($entry >> 8) & 0xff) == ($entry & 0xff) } { continue }
+        lappend out $entry_hex
+    }
+    return $out
+}
+proc _ALPN_2CHAR { proto } {
+    if { [string length $proto] < 1 } { return "00" }
+    set first [string index $proto 0]
+    set last  [string index $proto end]
+    set fb [scan $first %c]
+    set lb [scan $last %c]
+    set first_ok [expr { ($fb >= 0x30 && $fb <= 0x39) || ($fb >= 0x41 && $fb <= 0x5A) || ($fb >= 0x61 && $fb <= 0x7A) }]
+    set last_ok  [expr { ($lb >= 0x30 && $lb <= 0x39) || ($lb >= 0x41 && $lb <= 0x5A) || ($lb >= 0x61 && $lb <= 0x7A) }]
+    if { $first_ok && $last_ok } {
+        return "${first}${last}"
+    }
+    binary scan $proto H* hex
+    return "[string index $hex 0][string index $hex end]"
+}
+proc _U8_VECTOR { payload off limit } {
+    if { $off + 1 > $limit } { return "REJECT" }
+    binary scan $payload @${off}c vec_len
+    set vec_len [expr { $vec_len & 0xff }]
+    set pos [expr { $off + 1 }]
+    set end [expr { $pos + $vec_len }]
+    if { $end > $limit } { return "REJECT" }
+    set out     [list]
+    set u8_iter 0
+    while { $pos < $end } {
+        if { [incr u8_iter] > $static::MIDEYE_SHIELD_traffic_max_iter } { return "REJECT" }
+        binary scan $payload @${pos}c entry
+        lappend out [expr { $entry & 0xff }]
+        incr pos
+    }
+    return $out
+}
+proc _PARSE_CLIENTHELLO { payload total_needed } {
+    binary scan $payload @5c handshake_type
+    set handshake_type [expr { $handshake_type & 0xff }]
+    if { $handshake_type != 0x01 } {
+        return ""
+    }
+    binary scan $payload @6H6 hs_len_hex
+    if { [scan $hs_len_hex %x] != ($total_needed - 9) } {
+        return ""
+    }
+    binary scan $payload @9H4 ver_hex
+    set off 43
+    if { $off >= $total_needed } { return "" }
+    binary scan $payload @${off}c sessid_len
+    set sessid_len [expr { $sessid_len & 0xff }]
+    set off [expr { $off + 1 + $sessid_len }]
+    if { $off + 2 > $total_needed } { return "" }
+    binary scan $payload @${off}S cs_length
+    set cs_length [expr { $cs_length & 0xffff }]
+    incr off 2
+    if { ($cs_length % 2) != 0 || $off + $cs_length > $total_needed } {
+        return ""
+    }
+    set cs_end [expr { $off + $cs_length }]
+    set ciphers_hex [list]
+    set cs_iter 0
+    while { $off < $cs_end } {
+        if { [incr cs_iter] > $static::MIDEYE_SHIELD_traffic_max_iter } { return "" }
+        binary scan $payload @${off}H4 cs_hex
+        set cs_int [scan $cs_hex %x]
+        incr off 2
+        if { ($cs_int & 0x0f0f) == 0x0a0a && (($cs_int >> 8) & 0xff) == ($cs_int & 0xff) } {
+            continue
+        }
+        lappend ciphers_hex $cs_hex
+    }
+    set off $cs_end
+    if { $off + 1 > $total_needed } { return "" }
+    binary scan $payload @${off}c comp_len
+    set comp_len [expr { $comp_len & 0xff }]
+    set off [expr { $off + 1 + $comp_len }]
+    set has_sni       0
+    set alpn_2char    "00"
+    set alpn_proto    ""
+    set ja4_tprt      "t"
+    set ver_2char_src $ver_hex
+    set exts_hex      [list]
+    set curves_dec    [list]
+    set pointfmts_dec [list]
+    set sigalgs_hex   [list]
+    if { $off + 2 <= $total_needed } {
+        binary scan $payload @${off}S ext_total_len
+        set ext_total_len [expr { $ext_total_len & 0xffff }]
+        incr off 2
+        if { $off + $ext_total_len == $total_needed } {
+            set ext_end [expr { $off + $ext_total_len }]
+            set ext_iter 0
+            while { $off + 4 <= $ext_end } {
+                if { [incr ext_iter] > $static::MIDEYE_SHIELD_traffic_max_iter } { return "" }
+                binary scan $payload @${off}H4 et_hex
+                set et_int [scan $et_hex %x]
+                incr off 2
+                binary scan $payload @${off}S et_len
+                set et_len [expr { $et_len & 0xffff }]
+                incr off 2
+                set data_start $off
+                if { $data_start + $et_len > $ext_end } { return "" }
+                if { [info exists ext_seen($et_hex)] } { return "" }
+                set ext_seen($et_hex) 1
+                if { ($et_int & 0x0f0f) == 0x0a0a && (($et_int >> 8) & 0xff) == ($et_int & 0xff) } {
+                    set off [expr { $data_start + $et_len }]
+                    continue
+                }
+                lappend exts_hex $et_hex
+                switch $et_hex {
+                    "0000" {
+                        set has_sni 1
+                    }
+                    "000a" {
+                        set vec [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_U16_VECTOR \
+                            $payload $data_start [expr { $data_start + $et_len }] 2]
+                        if { $vec eq "REJECT" } { return "" }
+                        foreach curve $vec { lappend curves_dec [scan $curve %x] }
+                    }
+                    "000b" {
+                        set vec [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_U8_VECTOR \
+                            $payload $data_start [expr { $data_start + $et_len }]]
+                        if { $vec eq "REJECT" } { return "" }
+                        foreach fmt $vec { lappend pointfmts_dec $fmt }
+                    }
+                    "000d" {
+                        set vec [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_U16_VECTOR \
+                            $payload $data_start [expr { $data_start + $et_len }] 2]
+                        if { $vec eq "REJECT" } { return "" }
+                        foreach sigalg $vec { lappend sigalgs_hex $sigalg }
+                    }
+                    "0010" {
+                        if { $et_len >= 4 } {
+                            binary scan $payload @[expr {$data_start + 2}]c alpn_str_len
+                            set alpn_str_len [expr { $alpn_str_len & 0xff }]
+                            if { $alpn_str_len > 0 && $alpn_str_len + 3 <= $et_len } {
+                                binary scan $payload @[expr {$data_start + 3}]a${alpn_str_len} alpn_proto
+                                set alpn_2char [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_ALPN_2CHAR $alpn_proto]
+                            }
+                        }
+                    }
+                    "002b" {
+                        set vec [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_U16_VECTOR \
+                            $payload $data_start [expr { $data_start + $et_len }] 1]
+                        if { $vec eq "REJECT" } { return "" }
+                        set offered [lsort $vec]
+                        if { [llength $offered] > 0 } {
+                            set ver_2char_src [lindex $offered end]
+                        }
+                    }
+                }
+                set off [expr { $data_start + $et_len }]
+            }
+            if { $off != $ext_end } { return "" }
+        } else {
+            return ""
+        }
+    } elseif { $off != $total_needed } {
+        return ""
+    }
+    switch $ver_2char_src {
+        "0304"  { set ver_2char "13" }
+        "0303"  { set ver_2char "12" }
+        "0302"  { set ver_2char "11" }
+        "0301"  { set ver_2char "10" }
+        "0300"  { set ver_2char "s3" }
+        default { set ver_2char "00" }
+    }
+    set out(ver_hex)       $ver_hex
+    set out(ver_2char)     $ver_2char
+    set out(tprt)          $ja4_tprt
+    set out(has_sni)       $has_sni
+    set out(alpn_2char)    $alpn_2char
+    set out(alpn_proto)    $alpn_proto
+    set out(ciphers_hex)   $ciphers_hex
+    set out(exts_hex)      $exts_hex
+    set out(curves_dec)    $curves_dec
+    set out(pointfmts_dec) $pointfmts_dec
+    set out(sigalgs_hex)   $sigalgs_hex
+    return [array get out]
+}
+proc _COMPUTE_JA3 { hello_list } {
+    array set hello $hello_list
+    set parts [list]
+    foreach h $hello(ciphers_hex) { lappend parts [scan $h %x] }
+    set ciphers [join $parts "-"]
+    set parts [list]
+    foreach h $hello(exts_hex) { lappend parts [scan $h %x] }
+    set exts [join $parts "-"]
+    set curves [join $hello(curves_dec) "-"]
+    set fmts   [join $hello(pointfmts_dec) "-"]
+    set ver    [scan $hello(ver_hex) %x]
+    set ja3_str "${ver},${ciphers},${exts},${curves},${fmts}"
+    binary scan [md5 $ja3_str] H* out
+    return $out
+}
+proc _COMPUTE_JA4 { hello_list } {
+    array set hello $hello_list
+    set cl $hello(ciphers_hex)
+    set el $hello(exts_hex)
+    set sal $hello(sigalgs_hex)
+    set cc [llength $cl]
+    if { $cc > 99 } { set cc 99 }
+    set ec [llength $el]
+    if { $ec > 99 } { set ec 99 }
+    if { $hello(has_sni) } { set sni "d" } else { set sni "i" }
+    set ja4_a "$hello(tprt)$hello(ver_2char)${sni}[format %02d $cc][format %02d $ec]$hello(alpn_2char)"
+    set cipher_str [join [lsort $cl] ","]
+    if { $cipher_str eq "" } {
+        set ja4_b "000000000000"
+    } else {
+        binary scan [sha256 $cipher_str] H* ch
+        set ja4_b [string range $ch 0 11]
+    }
+    set ext_for_hash [list]
+    foreach e $el {
+        if { $e ne "0000" && $e ne "0010" } { lappend ext_for_hash $e }
+    }
+    set ext_str  [join [lsort $ext_for_hash] ","]
+    set siga_str [join $sal ","]
+    if { $siga_str ne "" } {
+        set hash_input "${ext_str}_${siga_str}"
+    } else {
+        set hash_input $ext_str
+    }
+    if { $ext_str eq "" && $siga_str eq "" } {
+        set ja4_c "000000000000"
+    } else {
+        binary scan [sha256 $hash_input] H* eh
+        set ja4_c [string range $eh 0 11]
+    }
+    return "${ja4_a}_${ja4_b}_${ja4_c}"
+}
+proc ENQUEUE_TRAFFIC { event_json } {
+    call /__partition__/MIDEYE_SHIELD_COMMON::_ENQUEUE_EVENT_DEFERRED "MIDEYE_SHIELD_TRAFFIC" $event_json \
+        $static::MIDEYE_SHIELD_traffic_batch_size \
+        $static::MIDEYE_SHIELD_traffic_flush_interval \
+        $static::MIDEYE_SHIELD_traffic_max_buffer
+}
+when CLIENT_ACCEPTED {
+    set ms_traffic_ch_pending 0
+    unset -nocomplain ms_traffic_ja3 ms_traffic_ja4 ms_traffic_tls_version \
+        ms_traffic_alpn ms_traffic_reported
+    if { $static::MIDEYE_SHIELD_traffic_enabled == 1 } {
+        set ms_traffic_ch_pending 1
+        TCP::collect
+    }
+}
+when CLIENT_DATA {
+    if { ![info exists ms_traffic_ch_pending] || $ms_traffic_ch_pending != 1 } {
+        return
+    }
+    set payload [TCP::payload]
+    set plen    [TCP::payload length]
+    if { $plen < 5 } {
+        TCP::collect 5
+        return
+    }
+    binary scan $payload cx2S content_type rlen
+    set content_type [expr { $content_type & 0xff }]
+    set rlen         [expr { $rlen & 0xffff }]
+    set total_needed [expr { $rlen + 5 }]
+    if { $content_type != 0x16
+         || $total_needed > $static::MIDEYE_SHIELD_traffic_max_record
+         || $total_needed < 44 } {
+        set ms_traffic_ch_pending 0
+        TCP::release
+        return
+    }
+    if { $plen < $total_needed } {
+        TCP::collect $total_needed
+        return
+    }
+    set ms_traffic_ch_pending 0
+    if { [catch {
+        set hello [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_PARSE_CLIENTHELLO $payload $total_needed]
+        if { $hello ne "" } {
+            set ms_traffic_ja3         [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_COMPUTE_JA3 $hello]
+            set ms_traffic_ja4         [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_COMPUTE_JA4 $hello]
+            array set hello_fields $hello
+            set ms_traffic_tls_version [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_MAP_TLS_VERSION $hello_fields(ver_2char)]
+            set ms_traffic_alpn        $hello_fields(alpn_proto)
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: fingerprint src=[IP::client_addr] ja3=$ms_traffic_ja3 ja4=$ms_traffic_ja4"
+        }
+    } err] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: ClientHello capture failed -> '$err'"
+    }
+    TCP::release
+}
+when HTTP_REQUEST {
+    if { $static::MIDEYE_SHIELD_traffic_enabled != 1 } {
+        return
+    }
+    if { [catch {
+        if { [info exists ms_traffic_ch_pending] && $ms_traffic_ch_pending == 1 } {
+            set ms_traffic_ch_pending 0
+            call /__partition__/MIDEYE_SHIELD_COMMON::LOG_WARNING "traffic-intel: no ClientHello captured; list MIDEYE_SHIELD_TRAFFIC after MIDEYE_SHIELD_CONNECTION on this Virtual Server"
+        }
+        set ip [lindex [split [IP::client_addr] "%"] 0]
+        set ts [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]
+        set full [expr { ![info exists ms_traffic_reported] }]
+        set tls ""
+        if { [info exists ms_traffic_ja3] || [info exists ms_traffic_ja4] } {
+            set tp [list]
+            if { [info exists ms_traffic_ja4] && $ms_traffic_ja4 ne "" } {
+                lappend tp "\"ja4\":\"$ms_traffic_ja4\""
+            }
+            if { $full } {
+                if { [info exists ms_traffic_tls_version] && $ms_traffic_tls_version ne "" } {
+                    lappend tp "\"version\":\"$ms_traffic_tls_version\""
+                }
+                if { [info exists ms_traffic_ja3] && $ms_traffic_ja3 ne "" } {
+                    lappend tp "\"ja3\":\"$ms_traffic_ja3\""
+                }
+                if { [info exists ms_traffic_alpn] && $ms_traffic_alpn ne "" } {
+                    set ae [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $ms_traffic_alpn 0 15]]
+                    lappend tp "\"alpn\":\"$ae\""
+                }
+                if { ![catch { set ms_traffic_cs [SSL::cipher name] }] && $ms_traffic_cs ne "" } {
+                    set ce [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $ms_traffic_cs 0 199]]
+                    lappend tp "\"cipherSuite\":\"$ce\""
+                }
+            }
+            if { [llength $tp] > 0 } {
+                set tls "\"tlsContext\":\{[join $tp ,]\}"
+            }
+        }
+        set hp [list]
+        set method [HTTP::method]
+        if { $method ne "" } {
+            set me [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $method 0 15]]
+            lappend hp "\"method\":\"$me\""
+        }
+        if { $full && [HTTP::header exists "User-Agent"] } {
+            set ua [string range [HTTP::header value "User-Agent"] 0 4095]
+            if { $ua ne "" } {
+                set ue [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE $ua]
+                lappend hp "\"userAgent\":\{\"rawValue\":\"$ue\"\}"
+            }
+        }
+        if { $full } {
+            set hitems [list]
+            set hcount 0
+            set hbytes 0
+            foreach name [HTTP::header names] {
+                if { $hcount >= 100 || $hbytes >= $static::MIDEYE_SHIELD_traffic_max_headers } { break }
+                if { $name eq "" } { continue }
+                if { [lsearch -exact $static::MIDEYE_SHIELD_traffic_forbidden_headers [string tolower $name]] >= 0 } { continue }
+                set ne [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $name 0 255]]
+                set hval ""
+                set cap [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_HEADER_VALUE_CAP $name]
+                if { $cap ne "" } {
+                    set hval [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE \
+                        [string range [HTTP::header value $name] 0 $cap]]
+                }
+                set hitem "\{\"name\":\"$ne\",\"value\":\"$hval\"\}"
+                lappend hitems $hitem
+                incr hbytes [string length $hitem]
+                incr hcount
+            }
+            if { [llength $hitems] > 0 } {
+                lappend hp "\"headers\":\[[join $hitems ,]\]"
+            }
+            set hv [call /__partition__/MIDEYE_SHIELD_TRAFFIC::_MAP_HTTP_VERSION [HTTP::version]]
+            if { $hv ne "" } {
+                lappend hp "\"httpVersion\":\"$hv\""
+            }
+        }
+        set http ""
+        if { [llength $hp] > 0 } {
+            set http "\"httpContext\":\{[join $hp ,]\}"
+        }
+        set dp [list]
+        set host [HTTP::host]
+        if { $host ne "" } {
+            set he [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $host 0 255]]
+            lappend dp "\"application\":\{\"id\":\"$he\"\}"
+        }
+        set path [HTTP::path]
+        if { $path ne "" } {
+            set pe [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $path 0 1023]]
+            lappend dp "\"resource\":\{\"id\":\"$pe\"\}"
+        }
+        set dest ""
+        if { [llength $dp] > 0 } {
+            set dest "\"destination\":\{[join $dp ,]\}"
+        }
+        set src ""
+        set sid $static::MIDEYE_SHIELD_traffic_sensor_id
+        if { $sid eq "" } {
+            set sid $static::MIDEYE_SHIELD_traffic_device_hostname
+        }
+        if { $sid eq "" } {
+            catch { set sid [info hostname] }
+        }
+        if { $sid ne "" } {
+            set sie [call /__partition__/MIDEYE_SHIELD_COMMON::_JSON_ESCAPE [string range $sid 0 255]]
+            set src "\"source\":\{\"id\":\"$sie\",\"type\":\"enforcement_point\"\}"
+        }
+        if { $tls ne "" || $http ne "" || $dest ne "" } {
+            set ep [list]
+            lappend ep "\"ipAddress\":\"$ip\""
+            lappend ep "\"observedAt\":\"$ts\""
+            if { $tls  ne "" } { lappend ep $tls }
+            if { $http ne "" } { lappend ep $http }
+            if { $dest ne "" } { lappend ep $dest }
+            if { $src  ne "" } { lappend ep $src }
+            set event "\{[join $ep ,]\}"
+            if { [string length $event] <= $static::MIDEYE_SHIELD_traffic_max_event } {
+                call /__partition__/MIDEYE_SHIELD_TRAFFIC::ENQUEUE_TRAFFIC $event
+            } else {
+                call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: oversized event dropped ([string length $event] bytes)"
+            }
+            set ms_traffic_reported 1
+        }
+    } err] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: HTTP_REQUEST capture failed -> '$err'"
+    }
+}
+when CLIENT_CLOSED {
+    if { $static::MIDEYE_SHIELD_traffic_enabled != 1 } {
+        return
+    }
+    if { [catch {
+        call /__partition__/MIDEYE_SHIELD_COMMON::_FLUSH_IF_DUE "MIDEYE_SHIELD_TRAFFIC" \
+            $static::MIDEYE_SHIELD_traffic_batch_size \
+            $static::MIDEYE_SHIELD_traffic_flush_interval \
+            $static::MIDEYE_SHIELD_traffic_max_buffer
+    } err] } {
+        call /__partition__/MIDEYE_SHIELD_COMMON::LOG_DEBUG "traffic-intel: deferred flush failed -> '$err'"
+    }
+}
 }
 
 # ----- bundled iRule body (verbatim): MIDEYE_SHIELD_HSSR_helper (from HSSR-helper.tcl) -----
@@ -3343,6 +3462,10 @@ tmsh::create ltm rule MIDEYE_SHIELD_COMMON $_BODY_MIDEYE_SHIELD_COMMON
 set _BODY_MIDEYE_SHIELD_CONNECTION [string map ${_SUBST_MAP} $_BODY_MIDEYE_SHIELD_CONNECTION]
 tmsh::create ltm rule MIDEYE_SHIELD_CONNECTION $_BODY_MIDEYE_SHIELD_CONNECTION
 
+# ----- Deploy iRule: MIDEYE_SHIELD_TRAFFIC -----
+set _BODY_MIDEYE_SHIELD_TRAFFIC [string map ${_SUBST_MAP} $_BODY_MIDEYE_SHIELD_TRAFFIC]
+tmsh::create ltm rule MIDEYE_SHIELD_TRAFFIC $_BODY_MIDEYE_SHIELD_TRAFFIC
+
 # ----- Optional HSSR helper install -----
 # Only when the administrator chose 'Install for me'.
 # These objects are iApp-owned (created inside the app
@@ -3378,8 +3501,8 @@ if { $::hssr__mode eq "install" } {
             presentation {
 
 section about {
-    message version "1.0.4"
-    message build_date "2026-08-14 16:33"
+    message version "1.0.5"
+    message build_date "2026-09-15 11:41"
 }
 section log {
     choice debug display "small" default "0" {
@@ -3459,9 +3582,19 @@ section block {
         "Yes" => "1",
         "No" => "0"
     }
-    string batch_size required display "small" default "200"
-    string flush_interval required display "small" default "10"
-    string max_buffer required display "small" default "1000"
+    string batch_size required display "small" default "1000" validator "NonNegativeNumber"
+    string flush_interval required display "small" default "10" validator "NonNegativeNumber"
+    string max_buffer required display "small" default "5000" validator "NonNegativeNumber"
+}
+section traffic {
+    choice enabled display "small" default "1" {
+        "Yes" => "1",
+        "No" => "0"
+    }
+    string batch_size required display "small" default "1000" validator "NonNegativeNumber"
+    string flush_interval required display "small" default "10" validator "NonNegativeNumber"
+    string max_buffer required display "small" default "5000" validator "NonNegativeNumber"
+    string sensor_id display "large" default ""
 }
 
 text {
@@ -3505,9 +3638,15 @@ text {
     hash.username_salt        "Username Salt (leave empty to auto-generate)"
     block                     "Blocked-connection reporting"
     block.enabled             "Report Blocked Connections to Shield"
-    block.batch_size          "Flush after this many buffered blocked events (N)"
-    block.flush_interval      "Flush at least this often, seconds (T)"
-    block.max_buffer          "Maximum buffered blocked events before dropping"
+    block.batch_size          "Flush after this many buffered blocked events (N; 0 = default)"
+    block.flush_interval      "Flush at least this often, seconds (T; 0 = default)"
+    block.max_buffer          "Maximum buffered blocked events before dropping (0 = default)"
+    traffic                   "Traffic Intelligence (client fingerprinting)"
+    traffic.enabled           "Report client fingerprints for all traffic"
+    traffic.batch_size        "Flush after this many buffered events (N; 0 = default)"
+    traffic.flush_interval    "Flush at least this often, seconds (T; 0 = default)"
+    traffic.max_buffer        "Max buffered events before dropping (fail-open cap; 0 = default)"
+    traffic.sensor_id         "Sensor id reported as the event source (leave empty to use this device's hostname)"
 }
 
             }
@@ -3518,7 +3657,7 @@ text {
     description "Mideye Shield - IP reputation and login validation"
     ignore-verification false
     requires-bigip-version-max none
-    requires-bigip-version-min 14.1
+    requires-bigip-version-min 17.1
     requires-modules { ltm }
     signing-key none
     tmpl-checksum none

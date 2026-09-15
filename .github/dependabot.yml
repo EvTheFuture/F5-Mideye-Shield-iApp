@@ -1,0 +1,12 @@
+version: 2
+
+# The workflows pin actions to a commit SHA rather than a tag, because a tag
+# can be moved to point at other code. That only stays safe if something keeps
+# the pins current, which is this file's job.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "CI"

@@ -1,0 +1,7 @@
+# Local scratch and editor state.
+.superpowers/
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+*.swp
